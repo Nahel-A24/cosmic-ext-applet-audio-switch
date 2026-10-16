@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.Nahel_A24.CosmicExtAppletAudioSwitch</id>
+
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+
+  <name>Audio Output Switch</name>
+  <name xml:lang="es">Selector de salida de audio</name>
+
+  <summary>Pick the analog audio output from the COSMIC panel</summary>
+  <summary xml:lang="es">Elige la salida de audio analógica desde el panel de COSMIC</summary>
+
+  <description>
+    <p>
+      A COSMIC panel applet that lets you force the analog audio output of an
+      HDA Intel PCH card. PipeWire and the driver's Auto-Mute Mode control
+      normally decide on their own whether sound goes to the rear line-out
+      (speakers) or to the front headphone jack, so there is no way to keep
+      playing through the speakers while headphones are plugged in.
+    </p>
+    <p>
+      This applet adds that choice by offering three actions: force the
+      speakers, force the headphones, or hand control back to the driver.
+    </p>
+    <p xml:lang="es">
+      Un applet del panel de COSMIC que permite forzar la salida de audio
+      analógica de una tarjeta HDA Intel PCH. PipeWire y el control Auto-Mute
+      Mode del driver deciden por su cuenta si el sonido sale por la línea de
+      salida trasera (Parlantes) o por el conector frontal de Auriculares, así
+      que no hay forma de seguir reproduciendo por los parlantes con los
+      auriculares conectados.
+    </p>
+    <p xml:lang="es">
+      Este applet agrega esa opción con tres acciones: forzar los Parlantes,
+      forzar los Auriculares, o devolverle el control al driver (Automático).
+    </p>
+  </description>
+
+  <launchable type="desktop-id">io.github.Nahel_A24.CosmicExtAppletAudioSwitch.desktop</launchable>
+
+  <provides>
+    <binary>cosmic-ext-applet-audio-switch</binary>
+  </provides>
+
+  <categories>
+    <category>AudioVideo</category>
+  </categories>
+
+  <developer id="io.github.nahel_a24">
+    <name>Nahel A24</name>
+  </developer>
+
+  <content_rating type="oars-1.1"/>
+
+  <releases>
+    <release version="0.1.0" date="2026-10-15"/>
+  </releases>
+  <url type="homepage">https://github.com/Nahel-A24/cosmic-ext-applet-audio-switch</url>
+</component>

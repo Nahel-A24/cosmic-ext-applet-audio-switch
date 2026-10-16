@@ -1,0 +1,16 @@
+[Desktop Entry]
+Type=Application
+Name=Audio Output Switch
+Name[es]=Selector de salida de audio
+Comment=Choose the analog audio output: speakers, headphones, or automatic
+Comment[es]=Elige la salida de audio analógica: Parlantes, Auriculares o Automático
+Exec=cosmic-ext-applet-audio-switch
+Icon=io.github.Nahel_A24.CosmicExtAppletAudioSwitch
+Terminal=false
+StartupNotify=true
+NoDisplay=true
+Categories=X-Cosmic;Utility;
+X-CosmicApplet=true
+X-CosmicShrinkable=true
+X-CosmicHoverPopup=Auto
+X-OverflowPriority=10

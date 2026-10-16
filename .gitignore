@@ -1,0 +1,7 @@
+/target
+
+# ODD task tracking (internal, not part of the applet)
+odd/
+
+# flatpak-builder work dir, written next to the manifest
+.flatpak-builder/

@@ -1,0 +1,32 @@
+[package]
+name = "cosmic-ext-applet-audio-switch"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "COSMIC panel applet to select the analog audio output (speakers / headphones / auto)"
+
+[dependencies.alsa]
+version = "0.12"
+default-features = false
+features = ["std"]
+
+[dependencies.libcosmic]
+git = "https://github.com/pop-os/libcosmic"
+default-features = false
+features = ["applet", "applet-token", "dbus-config", "multi-window", "tokio", "wayland"]
+
+[dependencies.tokio]
+version = "1"
+features = ["net", "io-util", "time", "rt"]
+
+[dependencies.tracing]
+version = "0.1"
+
+[dependencies.futures]
+version = "0.3"
+
+[dependencies.ron]
+version = "0.12"
+
+[dependencies.serde]
+version = "1"
