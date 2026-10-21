@@ -19,7 +19,6 @@ use cosmic::Element;
 use crate::audio::{self, OutputMode};
 use crate::control;
 use crate::state;
-
 /// Reverse-domain identifier of the applet.
 ///
 /// The underscore in the last segment is deliberate: Flatpak rejects an app ID
@@ -49,6 +48,26 @@ const RESTORE_ATTEMPTS: u8 = 25;
 /// before the user would notice the retries. The wait is a timer inside the
 /// task, never a blocking sleep on the UI path.
 const RESTORE_DELAY: Duration = Duration::from_millis(400);
+
+/// How often the driver's `Auto-Mute Mode` is re-asserted in a forced mode.
+///
+/// The driver turns that control back on by itself after a jack event, and a
+/// forced port does not survive while it is on. The interval is long enough to
+/// be invisible and short enough to put the control back before the user
+/// hears the output move.
+const AUTO_MUTE_GUARD_INTERVAL: Duration = Duration::from_secs(15);
+
+/// How long a mismatch has to persist before the forced mode is re-applied.
+///
+/// A volume change makes the driver report a port that is not the one in
+/// force for a moment. Re-applying on that transient is what used to fight
+/// the user's own volume control, so the mismatch has to hold still first.
+const MISMATCH_SETTLE: Duration = Duration::from_millis(1500);
+
+/// How many consecutive polls have to see the same mismatch before it counts.
+///
+/// One poll alone cannot tell a transient driver glitch from a real move.
+const MISMATCH_POLLS: u8 = 2;
 
 /// A pending startup restore of the persisted output mode.
 ///
@@ -104,6 +123,12 @@ pub struct AppModel {
     wrong_port: Option<String>,
     /// When the current mismatch started.
     mismatch_since: Option<Instant>,
+    /// When we last re-asserted that Auto-Mute stays disabled.
+    last_auto_mute_guard: Option<Instant>,
+    /// Port seen on the previous poll, to notice the driver moving it.
+    last_seen_port: Option<String>,
+    /// Volume the user last chose, captured before the driver moves the port.
+    last_volume: Option<u32>,
 }
 
 impl Default for AppModel {
@@ -120,78 +145,136 @@ impl Default for AppModel {
             wrong_count: 0,
             wrong_port: None,
             mismatch_since: None,
+            last_auto_mute_guard: None,
+            last_seen_port: None,
+            last_volume: None,
         }
     }
 }
 
 impl AppModel {
-    /// Re-reads the sink's active port from `pactl`.
+    /// Re-reads the sink's active port and volume from `pactl`.
     ///
-    /// If a user-forced mode was overridden by the driver (e.g. Auto-Mute
-    /// kicked in after volume changes), re-apply that forced mode to keep the
-    /// hardware in sync with the UI.
+    /// Three things happen here, in order:
     ///
-    /// Use hysteresis to avoid fighting transient jack sense flips on volume changes.
+    /// 1. A port the driver moved on its own is noticed. PipeWire keeps one
+    ///    volume per port, so the level the user chose belongs to the port
+    ///    they just left; in `Auto` the driver owns the port and the level is
+    ///    carried over so the mixer never jumps.
+    /// 2. `Auto-Mute Mode` is re-asserted in a forced mode, because the driver
+    ///    turns it back on by itself and a forced port does not survive that.
+    /// 3. A forced mode whose port was overridden for good is re-applied.
+    ///
+    /// The re-apply waits for the mismatch to settle first: a volume change
+    /// makes the driver report a port that is not the one in force for a
+    /// moment, and re-applying on that transient is what used to fight the
+    /// user's own volume control.
     fn refresh(&mut self) {
-        self.active_port = audio::active_port().ok().flatten();
+        let state = audio::sink_state().unwrap_or_default();
+        let port = state.port;
 
-        if matches!(self.mode, OutputMode::Auto) {
+        let moved = self.last_seen_port.is_some() && self.last_seen_port != port;
+        let forced_port = self.mode.forced_port();
+
+        // The volume belongs to the port that is active, and PipeWire keeps one
+        // volume per port. It is therefore only worth remembering while the
+        // active port is the one in force: once the driver moved elsewhere,
+        // the level on screen is that other port's stored level, not the
+        // user's. Losing that distinction is what made a forced switch land
+        // on the wrong number.
+        let on_forced_port = match forced_port {
+            Some(forced) => port.as_deref() == Some(forced),
+            None => true,
+        };
+
+        if moved {
+            // The driver moved the port, so the volume now on screen belongs
+            // to the new port. The level the user chose is written back onto
+            // it, which is only needed when the driver owns the port: in a
+            // forced mode the re-apply below carries the volume across.
+            if forced_port.is_none() {
+                if let Some(volume) = self.last_volume {
+                    let _ = audio::set_sink_volume(volume);
+                }
+            }
+        } else if on_forced_port {
+            if let Some(volume) = state.volume {
+                self.last_volume = Some(volume);
+            }
+        }
+
+        self.last_seen_port = port.clone();
+        self.active_port = port;
+
+        if forced_port.is_none() {
             self.wrong_count = 0;
             self.wrong_port = None;
             self.mismatch_since = None;
             return;
         }
 
-        if let Some(forced) = self.mode.forced_port() {
-            let active = self.active_port.as_deref();
+        // The driver can switch `Auto-Mute Mode` back on by itself, and a
+        // forced port does not survive that.
+        let guard_due = self
+            .last_auto_mute_guard
+            .map(|at| at.elapsed() >= AUTO_MUTE_GUARD_INTERVAL)
+            .unwrap_or(true);
 
-            // Already at our forced port, or driver chose same port as forced
-            if active == Some(forced) || self.last_forced_port.as_deref() == active {
-                self.wrong_count = 0;
-                self.wrong_port = None;
-                self.mismatch_since = None;
-                self.last_forced_port = Some(forced.to_string());
-                return;
-            }
+        if guard_due {
+            let _ = audio::ensure_auto_mute(false);
+            self.last_auto_mute_guard = Some(Instant::now());
+        }
 
-            // Port doesn't match forced port - check if it's a persistent flip
-            if active != Some(forced) {
-                // If we just applied a forced mode, give the hardware time to settle
-                if let Some(last) = self.last_forced_apply {
-                    if last.elapsed() < Duration::from_secs(3) {
-                        return;
-                    }
-                }
+        let Some(forced) = self.mode.forced_port() else {
+            return;
+        };
 
-                // Track consecutive wrong ports
-                if self.wrong_port.as_deref() == active {
-                    self.wrong_count = self.wrong_count.saturating_add(1);
-                } else {
-                    self.wrong_port = active.map(|s| s.to_string());
-                    self.wrong_count = 1;
-                    self.mismatch_since = Some(Instant::now());
-                }
+        let active = self.active_port.as_deref();
 
-                // Only re-apply if mismatch has persisted for long enough
-                // and we've seen it for multiple consecutive polls
-                if self.wrong_count >= 2 {
-                    if let Some(since) = self.mismatch_since {
-                        if since.elapsed() >= Duration::from_millis(1500) {
-                            let _ = audio::apply(self.mode);
-                            self.last_forced_apply = Some(Instant::now());
-                            self.last_forced_port = Some(forced.to_string());
-                            self.active_port = audio::active_port().ok().flatten();
-                            self.wrong_count = 0;
-                            self.wrong_port = None;
-                            self.mismatch_since = None;
-                            return;
-                        }
-                    }
-                }
-                return;
-            }
-
+        // Already at our forced port, or the driver chose the same port as
+        // the one we forced last time.
+        if active == Some(forced) || self.last_forced_port.as_deref() == active {
+            self.wrong_count = 0;
+            self.wrong_port = None;
+            self.mismatch_since = None;
             self.last_forced_port = Some(forced.to_string());
+            return;
+        }
+
+        // The port is not the one in force. Wait for the hardware to settle
+        // after the last apply before treating it as a real mismatch.
+        if let Some(last) = self.last_forced_apply {
+            if last.elapsed() < Duration::from_secs(3) {
+                return;
+            }
+        }
+
+        // Track consecutive polls that saw the same wrong port.
+        if self.wrong_port.as_deref() == active {
+            self.wrong_count = self.wrong_count.saturating_add(1);
+        } else {
+            self.wrong_port = active.map(|s| s.to_string());
+            self.wrong_count = 1;
+            self.mismatch_since = Some(Instant::now());
+        }
+
+        let settled = self
+            .mismatch_since
+            .map(|since| since.elapsed() >= MISMATCH_SETTLE)
+            .unwrap_or(false);
+
+        if self.wrong_count >= MISMATCH_POLLS && settled {
+            // The level the user had on the forced port is carried across the
+            // switch: by now the sink shows the level stored on the port the
+            // driver moved to, and restoring that would land on the wrong
+            // number.
+            let _ = audio::apply_preserving(self.mode, self.last_volume);
+            self.last_forced_apply = Some(Instant::now());
+            self.last_forced_port = Some(forced.to_string());
+            self.active_port = audio::sink_state().ok().and_then(|state| state.port);
+            self.wrong_count = 0;
+            self.wrong_port = None;
+            self.mismatch_since = None;
         }
     }
 
@@ -207,30 +290,28 @@ impl AppModel {
     /// leaves the previously saved intent untouched instead of promoting an
     /// intent that never took effect.
     ///
-    /// In `Auto` the driver owns port arbitration; do not call `audio::apply`
-    /// on user-triggered changes as it can flip ports in response to volume/sink
-    /// events on some HDA codecs.
+    /// In `Auto` the driver owns port arbitration; the applet only re-enables
+    /// the driver's own control and leaves the port alone.
     fn set_mode(&mut self, mode: OutputMode) {
         self.mode = mode;
         self.wrong_count = 0;
         self.wrong_port = None;
         self.mismatch_since = None;
-        let result = match mode {
-            OutputMode::Auto => Ok(()),
-            other => {
-                let r = audio::apply(other);
-                if r.is_ok() {
-                    if let Some(f) = other.forced_port() {
-                        self.last_forced_apply = Some(Instant::now());
-                        self.last_forced_port = Some(f.to_string());
-                    }
-                }
-                r
-            }
-        };
+
+        // A mode the user picked wins over a startup restore that is still
+        // retrying: the restore would otherwise re-apply the old mode over
+        // the new choice a moment later.
+        self.restore = None;
+
+        let result = audio::apply(mode);
 
         if result.is_ok() {
             state::save(mode);
+
+            if let Some(forced) = mode.forced_port() {
+                self.last_forced_apply = Some(Instant::now());
+                self.last_forced_port = Some(forced.to_string());
+            }
         }
 
         self.error = result.err().map(|err| err.to_string());
@@ -415,16 +496,21 @@ impl cosmic::Application for AppModel {
                     return Task::none();
                 };
 
-                match match restore.mode {
-                    OutputMode::Auto => Ok(()),
-                    other => audio::apply(other),
-                } {
+                match audio::apply(restore.mode) {
                     // The state file already records this mode, so the restore
                     // path never writes it: a write on a failed attempt would
                     // overwrite the persisted intent with a value that did not
                     // reach the hardware.
                     Ok(()) => {
                         self.error = None;
+
+                        // The mode is now in force, so the periodic check must
+                        // not treat the port as a mismatch right away.
+                        if let Some(forced) = restore.mode.forced_port() {
+                            self.last_forced_apply = Some(Instant::now());
+                            self.last_forced_port = Some(forced.to_string());
+                        }
+
                         self.refresh();
                     }
                     Err(error) => match restore.on_failure() {

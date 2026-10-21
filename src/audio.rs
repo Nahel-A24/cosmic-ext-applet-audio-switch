@@ -36,6 +36,13 @@ const ANALOG_PORT_PREFIX: &str = "analog-output-";
 /// Name of the HDA driver control that arbitrates speakers vs headphones.
 const AUTO_MUTE_CONTROL: &str = "Auto-Mute Mode";
 
+/// Channel names that mark a `pactl` line as carrying a live volume.
+///
+/// The volume label itself is translated, but PulseAudio prints the channel
+/// names untranslated, so they are the locale-independent anchor. The base
+/// volume line has none of them and is skipped.
+const VOLUME_CHANNEL_MARKERS: [&str; 3] = ["front-left:", "front-right:", "mono:"];
+
 /// Display name for the sink port the driver currently has live.
 ///
 /// The popup caption is user-facing, so the two ports this applet can force get
@@ -226,6 +233,17 @@ impl std::error::Error for AudioError {}
 
 /// Applies an output mode to the live sound stack.
 pub fn apply(mode: OutputMode) -> Result<(), AudioError> {
+    apply_preserving(mode, None)
+}
+
+/// Applies an output mode, carrying a known volume level across the switch.
+///
+/// `volume` is the level the user chose. `None` means "use whatever the sink
+/// is playing right now", which is what a switch the user just asked for
+/// wants. The correction path passes the level it saw *before* the driver
+/// moved the port: by then the sink already shows the other port's stored
+/// level, so capturing it here would restore the wrong number.
+pub fn apply_preserving(mode: OutputMode, volume: Option<u32>) -> Result<(), AudioError> {
     // A single discovery feeds both halves of a mode change: the sink name
     // drives the port and the sink's own ALSA card drives the mixer. It also
     // runs before anything is written, so a machine with no analog sink fails
@@ -238,22 +256,32 @@ pub fn apply(mode: OutputMode) -> Result<(), AudioError> {
             // leave `Auto-Mute Mode` enabled and the driver re-mutes the
             // line-out (or moves the port back) as soon as the jack changes.
             set_auto_mute(false, sink.alsa_card)?;
-            set_sink_port_on(&sink.name, port)
+
+            // PipeWire stores one volume per port, so moving the port swaps the
+            // visible volume for the level stored on the target port. The
+            // volume is captured before the switch and written back onto the
+            // new port afterwards, so forcing an output never changes how loud
+            // the user hears it.
+            let volume = volume.or(sink.volume);
+            set_sink_port_on(&sink.name, port)?;
+
+            if let Some(percent) = volume {
+                let _ = set_sink_volume_on(&sink.name, percent);
+            }
+
+            Ok(())
         }
-        // `Auto` hands arbitration back to the driver. On some HDA codecs,
-        // switching directly from a forced port to Auto-Mute Enabled can leave
-        // the driver "stuck" on the last forced port. To nudge it to
-        // re-evaluate jack presence, briefly force the headphones port (which
-        // the driver treats as the "jacked" path) and then re-enable
-        // Auto-Mute without touching the port after that.
-        None => {
-            let _ = std::process::Command::new("pactl")
-                .args(["set-sink-port", sink.name.as_str(), PORT_HEADPHONES])
-                .env("LC_ALL", "C")
-                .output();
-            std::thread::sleep(std::time::Duration::from_millis(200));
-            set_auto_mute(true, sink.alsa_card)
-        }
+        // `Auto` hands arbitration back to the driver: `Auto-Mute Mode` is
+        // re-enabled and the port is left exactly where it is. Forcing a port
+        // here would fight the driver on the next jack event, and switching
+        // ports behind the user's back is what makes the volume jump.
+        //
+        // A codec without that control is already handing arbitration to the
+        // driver, so there is nothing to give back and the mode still holds.
+        None => match set_auto_mute(true, sink.alsa_card) {
+            Err(AudioError::AutoMuteControlMissing) => Ok(()),
+            other => other,
+        },
     }
 }
 
@@ -318,6 +346,13 @@ struct Sink {
     /// It covers USB and other non-PCI buses, which carry no PCI address in the
     /// node name, and nothing here needs `/sys`.
     alsa_card: Option<i32>,
+    /// Current sink volume, as a percentage of the base volume.
+    ///
+    /// PipeWire keeps one volume per port, so this value belongs to the port
+    /// that is active right now. Moving the port swaps it for the value stored
+    /// on the target port, which is why the applet has to carry the volume
+    /// across a port switch.
+    volume: Option<u32>,
 }
 
 /// Does this sink expose at least one `analog-output-*` port?
@@ -378,43 +413,99 @@ fn active_port_entry(line: &str) -> Option<&str> {
     (value.starts_with(ANALOG_PORT_PREFIX) && !value.contains(char::is_whitespace)).then_some(value)
 }
 
+/// Reads the sink volume percentage from a line, if the line carries one.
+///
+/// The label is localized (`Volume:` / `Volumen:`) but the channel names are
+/// not, so the line is recognized by its channel names and the percentage is
+/// read from the `<raw> / <percent>% / <decibels>` shape. The base-volume line
+/// carries no channel names and is therefore ignored, as is the same shape
+/// printed for a source or a stream.
+fn volume_entry(line: &str) -> Option<u32> {
+    if !VOLUME_CHANNEL_MARKERS
+        .iter()
+        .any(|marker| line.contains(marker))
+    {
+        return None;
+    }
+
+    line.split('/')
+        .find_map(|part| part.trim().strip_suffix('%'))
+        .and_then(|value| value.trim().parse().ok())
+}
+
+/// Is this the header line that opens a sink block?
+///
+/// `pactl` prints `Sink #12` in English and `Destino #12` in Spanish, so only
+/// the index is locale-independent. It is what separates one sink's fields
+/// from the next one's, and it matters because a localized output names the
+/// sink only in its properties block — after the fields that come before it.
+fn is_sink_header(line: &str) -> bool {
+    let Some((label, index)) = line.rsplit_once('#') else {
+        return false;
+    };
+
+    // A property value such as `device.id = "#12"` carries an equals sign and
+    // a quote, and is not a block header.
+    if label.contains('=') || label.contains('"') {
+        return false;
+    }
+
+    !index.is_empty() && index.chars().all(|char| char.is_ascii_digit())
+}
+
 /// Parses `pactl list sinks` output into the sinks it describes.
 ///
 /// Pure on purpose: the parsing rules (which fields are locale-independent,
 /// where a sink starts and ends) are the part worth testing, and they must not
 /// need a running sound server.
+///
+/// The output is split into sink blocks first, because a localized output
+/// names the sink in its properties block: the fields that come before that
+/// name — the volume among them — would otherwise land on the previous sink.
 fn parse_sinks(output: &str) -> Vec<Sink> {
     let mut sinks: Vec<Sink> = Vec::new();
+    let mut current = Sink::default();
 
     for raw in output.lines() {
         let line = raw.trim();
 
-        if let Some(name) = sink_name(line) {
-            match sinks.last() {
-                // `Name:` and `node.name` describe the same sink; do not open a
-                // new block when they repeat the current name.
-                Some(last) if last.name == name => {}
-                _ => sinks.push(Sink {
-                    name,
-                    ..Sink::default()
-                }),
+        if is_sink_header(line) {
+            if !current.name.is_empty() {
+                sinks.push(std::mem::take(&mut current));
+            } else {
+                current = Sink::default();
             }
             continue;
         }
 
-        let Some(sink) = sinks.last_mut() else {
+        if let Some(name) = sink_name(line) {
+            // `Name:` and `node.name` describe the same sink; the second one
+            // must not replace the name the first one already gave.
+            if current.name.is_empty() || current.name != name {
+                current.name = name;
+            }
             continue;
-        };
+        }
 
         if let Some(port) = port_entry(line) {
-            if !sink.ports.iter().any(|existing| existing == port) {
-                sink.ports.push(port.to_owned());
+            if !current.ports.iter().any(|existing| existing == port) {
+                current.ports.push(port.to_owned());
             }
         } else if let Some(active) = active_port_entry(line) {
-            sink.active_port = Some(active.to_owned());
+            current.active_port = Some(active.to_owned());
         } else if let Some(card) = sink_card(line) {
-            sink.alsa_card = Some(card);
+            current.alsa_card = Some(card);
+        } else if let Some(volume) = volume_entry(line) {
+            // The first volume line of a sink block is the live volume; the
+            // base volume that follows it is rejected by the channel check.
+            if current.volume.is_none() {
+                current.volume = Some(volume);
+            }
         }
+    }
+
+    if !current.name.is_empty() {
+        sinks.push(current);
     }
 
     sinks
@@ -473,14 +564,56 @@ fn set_sink_port_on(sink: &str, port: &str) -> Result<(), AudioError> {
     }
 }
 
-/// Reads the analog sink's currently active port from `pactl list sinks`.
+/// Writes a volume percentage onto an already-discovered sink.
 ///
-/// Returns `None` when the sink is found but exposes no active-port field.
-pub fn active_port() -> Result<Option<String>, AudioError> {
+/// The percentage is applied to the sink's *active* port, which is what makes
+/// it the right call after a port switch: the value lands on the port the user
+/// is now listening through instead of on the one they just left.
+fn set_sink_volume_on(sink: &str, percent: u32) -> Result<(), AudioError> {
+    let value = format!("{percent}%");
+    let args = ["set-sink-volume", sink, value.as_str()];
+    let output = pactl(&args)?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(AudioError::Command {
+            args: args.join(" "),
+            status: output.status,
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        })
+    }
+}
+
+/// Live state of the analog sink: the active port and the current volume.
+///
+/// Both come from a single `pactl list sinks` call so the periodic check does
+/// not pay for two processes every tick.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SinkState {
+    /// Port the sink is playing through right now.
+    pub port: Option<String>,
+    /// Volume of that port, as a percentage of the base volume.
+    pub volume: Option<u32>,
+}
+
+/// Reads the analog sink's active port and volume.
+pub fn sink_state() -> Result<SinkState, AudioError> {
     let output = pactl_stdout(&["list", "sinks"])?;
     let default = default_sink().ok().flatten();
 
-    Ok(find_analog_sink(&output, default.as_deref()).and_then(|sink| sink.active_port))
+    Ok(find_analog_sink(&output, default.as_deref())
+        .map(|sink| SinkState {
+            port: sink.active_port,
+            volume: sink.volume,
+        })
+        .unwrap_or_default())
+}
+
+/// Writes a volume percentage onto the analog sink's active port.
+pub fn set_sink_volume(percent: u32) -> Result<(), AudioError> {
+    let sink = discover_analog_sink()?;
+    set_sink_volume_on(&sink.name, percent)
 }
 
 /// Chooses the enum item index whose label matches `wanted`.
@@ -560,11 +693,17 @@ pub fn set_auto_mute(enabled: bool, sink_card: Option<i32>) -> Result<(), AudioE
 
         let index = choose_auto_mute_item(&items, wanted)?;
 
-        // `Auto-Mute Mode` is a single (mono) enum control, so any channel
-        // works; `SelemChannelId::mono()` documents that intent.
-        selem
-            .set_enum_item(SelemChannelId::mono(), index)
-            .map_err(AudioError::Alsa)?;
+        // Writing the value the control already holds still notifies the
+        // driver, and the driver reacts by re-routing the analog outputs. A
+        // redundant write is therefore skipped, which keeps the periodic
+        // guard free of side effects.
+        if selem.get_enum_item(SelemChannelId::mono()).ok() != Some(index) {
+            // `Auto-Mute Mode` is a single (mono) enum control, so any channel
+            // works; `SelemChannelId::mono()` documents that intent.
+            selem
+                .set_enum_item(SelemChannelId::mono(), index)
+                .map_err(AudioError::Alsa)?;
+        }
 
         // `selem` (declared last) drops before `mixer`; closing the mixer is
         // what commits the change.
@@ -572,6 +711,16 @@ pub fn set_auto_mute(enabled: bool, sink_card: Option<i32>) -> Result<(), AudioE
     }
 
     Err(AudioError::AutoMuteControlMissing)
+}
+
+/// Re-asserts the driver's `Auto-Mute Mode` on the analog sink's own card.
+///
+/// The driver can turn the control back on by itself after a jack event, and
+/// a forced port does not survive that. This is the guard that puts it back,
+/// aimed at the same card the sink plays through.
+pub(crate) fn ensure_auto_mute(enabled: bool) -> Result<(), AudioError> {
+    let sink = discover_analog_sink()?;
+    set_auto_mute(enabled, sink.alsa_card)
 }
 
 #[cfg(test)]
@@ -584,6 +733,8 @@ Sink #57
 \tState: RUNNING
 \tName: alsa_output.pci-0000_00_1f.3.analog-stereo
 \tDescription: Analog Stereo
+\tVolume: front-left: 45875 /  70% / -9.29 dB,   front-right: 45875 /  70% / -9.29 dB
+\tBase Volume: 65536 / 100% / 0.00 dB
 \tProperties:
 \t\talsa.card = \"0\"
 \t\tapi.alsa.card = \"0\"
@@ -605,6 +756,8 @@ Destino #57
 \tEstado: RUNNING
 \tNombre: alsa_output.pci-0000_00_1f.3.analog-stereo
 \tDescripción: Audio Interno Estéreo analógico
+\tVolumen: front-left: 45875 /  70% / -9,29 dB,   front-right: 45875 /  70% / -9,29 dB
+\tVolumen base: 65536 / 100% / 0,00 dB
 \tPropiedades:
 \t\tnode.name = \"alsa_output.pci-0000_00_1f.3.analog-stereo\"
 \tPuertos:
@@ -727,6 +880,85 @@ Sink #2
             sinks[0].active_port.as_deref(),
             Some("analog-output-headphones")
         );
+    }
+
+    #[test]
+    fn reads_the_sink_volume() {
+        // The volume is needed to carry the user's level across a port switch:
+        // PipeWire keeps one volume per port.
+        let sinks = parse_sinks(C_LOCALE);
+        assert_eq!(sinks[0].volume, Some(70), "{sinks:?}");
+    }
+
+    #[test]
+    fn reads_the_volume_under_a_translated_locale() {
+        // The label is translated and the decimals use a comma, but the
+        // channel names and the `<raw> / <percent>% / <db>` shape are not.
+        let sink = find_analog_sink(SPANISH_LOCALE, None).expect("analog sink");
+        assert_eq!(sink.volume, Some(70), "{sink:?}");
+    }
+
+    #[test]
+    fn the_base_volume_is_not_the_sink_volume() {
+        // The base volume follows the live one in the same block; taking it
+        // would report a constant 100% and lose the user's level.
+        assert_eq!(volume_entry("Base Volume: 65536 / 100% / 0.00 dB"), None);
+        assert_eq!(volume_entry("Volumen base: 65536 / 100% / 0,00 dB"), None);
+    }
+
+    #[test]
+    fn the_volume_is_read_from_the_percentage_segment() {
+        assert_eq!(
+            volume_entry("Volume: front-left: 45875 /  70% / -9.29 dB,   front-right: 45875 /  70% / -9.29 dB"),
+            Some(70)
+        );
+        assert_eq!(
+            volume_entry("Volumen: front-left: 32768 /  50% / -18,06 dB"),
+            Some(50)
+        );
+        assert_eq!(
+            volume_entry("Volume: mono: 65536 / 100% / 0.00 dB"),
+            Some(100)
+        );
+    }
+
+    #[test]
+    fn a_sink_without_a_volume_line_reports_no_volume() {
+        let sinks = parse_sinks(OTHER_PCI);
+        assert_eq!(sinks[0].volume, None, "{sinks:?}");
+    }
+
+    #[test]
+    fn the_sink_blocks_are_split_by_their_index() {
+        // Each block carries its own fields. A localized output names the sink
+        // only in its properties block, so without the split the second sink's
+        // volume would land on the first one.
+        let output = "\
+Destino #1
+\tVolumen: front-left: 45875 /  70% / -9,29 dB
+\tnode.name = \"alsa_output.first.analog-stereo\"
+Destino #2
+\tVolumen: front-left: 26214 /  40% / -18,61 dB
+\tnode.name = \"alsa_output.second.analog-stereo\"
+";
+        let sinks = parse_sinks(output);
+
+        assert_eq!(sinks.len(), 2, "{sinks:?}");
+        assert_eq!(sinks[0].name, "alsa_output.first.analog-stereo");
+        assert_eq!(sinks[0].volume, Some(70), "{sinks:?}");
+        assert_eq!(sinks[1].name, "alsa_output.second.analog-stereo");
+        assert_eq!(sinks[1].volume, Some(40), "{sinks:?}");
+    }
+
+    #[test]
+    fn a_property_value_is_not_a_block_header() {
+        assert!(is_sink_header("Sink #57"));
+        assert!(is_sink_header("Destino #57"));
+        assert!(!is_sink_header("device.id = \"#12\""));
+        assert!(!is_sink_header("Active Port: analog-output-lineout"));
+        assert!(!is_sink_header(
+            "Volume: front-left: 45875 / 70% / -9.29 dB"
+        ));
     }
 
     #[test]
