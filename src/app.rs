@@ -133,7 +133,7 @@ impl AppModel {
         if let Some(forced) = self.mode.forced_port() {
             // If we just forced it, or it's been less than 1s, don't fight it
             if let Some(last) = self.last_forced_apply {
-                if last.elapsed() < Duration::from_secs(1) {
+                if last.elapsed() < Duration::from_secs(2) {
                     return;
                 }
             }
@@ -409,7 +409,7 @@ impl cosmic::Application for AppModel {
         // Each socket request becomes `Message::Cycle`, applied in-process so the
         // panel icon and the popup check mark follow the change.
         let control = control::subscription().map(|_| Message::Cycle);
-        let poll = cosmic::iced::time::every(Duration::from_millis(500)).map(|_| Message::CheckPort);
+        let poll = cosmic::iced::time::every(Duration::from_secs(2)).map(|_| Message::CheckPort);
         Subscription::batch(vec![control, poll])
     }
 
