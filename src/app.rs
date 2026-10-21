@@ -124,11 +124,18 @@ impl AppModel {
     ///
     /// The choice is persisted only once the hardware actually accepted it: the
     /// state file records the mode the user is really in, so a failed apply
-    /// leaves the previously saved mode untouched instead of promoting an
+    /// leaves the previously saved intent untouched instead of promoting an
     /// intent that never took effect.
+    ///
+    /// In `Auto` the driver owns port arbitration; do not call `audio::apply`
+    /// on user-triggered changes as it can flip ports in response to volume/sink
+    /// events on some HDA codecs.
     fn set_mode(&mut self, mode: OutputMode) {
         self.mode = mode;
-        let result = audio::apply(mode);
+        let result = match mode {
+            OutputMode::Auto => Ok(()),
+            other => audio::apply(other),
+        };
 
         if result.is_ok() {
             state::save(mode);
@@ -311,7 +318,10 @@ impl cosmic::Application for AppModel {
                     return Task::none();
                 };
 
-                match audio::apply(restore.mode) {
+                match match restore.mode {
+                    OutputMode::Auto => Ok(()),
+                    other => audio::apply(other),
+                } {
                     // The state file already records this mode, so the restore
                     // path never writes it: a write on a failed attempt would
                     // overwrite the persisted intent with a value that did not
