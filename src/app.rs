@@ -4,7 +4,7 @@
 //! three actions. The icon and the highlighted action follow the selected mode,
 //! and the popup shows the sink's currently active port for reference.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use cosmic::app::{Core, Task};
 use cosmic::applet::{menu_button, padded_control};
@@ -94,6 +94,10 @@ pub struct AppModel {
     error: Option<String>,
     /// Startup-only retry of the persisted mode, while the sound stack comes up.
     restore: Option<Restore>,
+    /// When we last re-applied a forced mode to avoid fighting volume changes.
+    last_forced_apply: Option<Instant>,
+    /// The port we most recently forced, to detect real flips.
+    last_forced_port: Option<String>,
 }
 
 impl Default for AppModel {
@@ -105,6 +109,8 @@ impl Default for AppModel {
             active_port: None,
             error: None,
             restore: None,
+            last_forced_apply: None,
+            last_forced_port: None,
         }
     }
 }
@@ -115,6 +121,8 @@ impl AppModel {
     /// If a user-forced mode was overridden by the driver (e.g. Auto-Mute
     /// kicked in after volume changes), re-apply that forced mode to keep the
     /// hardware in sync with the UI.
+    ///
+    /// Throttle re-applies to avoid fighting volume slider changes.
     fn refresh(&mut self) {
         self.active_port = audio::active_port().ok().flatten();
 
@@ -123,9 +131,23 @@ impl AppModel {
         }
 
         if let Some(forced) = self.mode.forced_port() {
+            // If we just forced it, or it's been less than 1s, don't fight it
+            if let Some(last) = self.last_forced_apply {
+                if last.elapsed() < Duration::from_secs(1) {
+                    return;
+                }
+            }
+            // Only re-apply if the port actually changed from what we last forced
+            if self.last_forced_port.as_deref() == self.active_port.as_deref() {
+                return;
+            }
             if self.active_port.as_deref() != Some(forced) {
                 let _ = audio::apply(self.mode);
+                self.last_forced_apply = Some(Instant::now());
+                self.last_forced_port = Some(forced.to_string());
                 self.active_port = audio::active_port().ok().flatten();
+            } else {
+                self.last_forced_port = Some(forced.to_string());
             }
         }
     }
@@ -149,7 +171,16 @@ impl AppModel {
         self.mode = mode;
         let result = match mode {
             OutputMode::Auto => Ok(()),
-            other => audio::apply(other),
+            other => {
+                let r = audio::apply(other);
+                if r.is_ok() {
+                    if let Some(f) = other.forced_port() {
+                        self.last_forced_apply = Some(Instant::now());
+                        self.last_forced_port = Some(f.to_string());
+                    }
+                }
+                r
+            }
         };
 
         if result.is_ok() {
