@@ -111,8 +111,23 @@ impl Default for AppModel {
 
 impl AppModel {
     /// Re-reads the sink's active port from `pactl`.
+    ///
+    /// If a user-forced mode was overridden by the driver (e.g. Auto-Mute
+    /// kicked in after volume changes), re-apply that forced mode to keep the
+    /// hardware in sync with the UI.
     fn refresh(&mut self) {
         self.active_port = audio::active_port().ok().flatten();
+
+        if matches!(self.mode, OutputMode::Auto) {
+            return;
+        }
+
+        if let Some(forced) = self.mode.forced_port() {
+            if self.active_port.as_deref() != Some(forced) {
+                let _ = audio::apply(self.mode);
+                self.active_port = audio::active_port().ok().flatten();
+            }
+        }
     }
 
     /// Selects a mode, applies it and refreshes the reported port.
@@ -236,6 +251,8 @@ pub enum Message {
     Surface(cosmic::surface::Action<Message>),
     /// One startup attempt at re-applying the persisted mode.
     RestoreAttempt,
+    /// Periodic check to re-assert a forced output mode if the driver flipped it.
+    CheckPort,
 }
 
 impl cosmic::Application for AppModel {
@@ -308,6 +325,9 @@ impl cosmic::Application for AppModel {
             Message::Cycle => {
                 self.set_mode(self.mode.next());
             }
+            Message::CheckPort => {
+                self.refresh();
+            }
             Message::Surface(action) => {
                 return cosmic::task::message(cosmic::Action::Surface(action));
             }
@@ -357,7 +377,9 @@ impl cosmic::Application for AppModel {
     fn subscription(&self) -> Subscription<Message> {
         // Each socket request becomes `Message::Cycle`, applied in-process so the
         // panel icon and the popup check mark follow the change.
-        control::subscription().map(|_| Message::Cycle)
+        let control = control::subscription().map(|_| Message::Cycle);
+        let poll = cosmic::iced::time::every(Duration::from_millis(500)).map(|_| Message::CheckPort);
+        Subscription::batch(vec![control, poll])
     }
 
     fn view(&self) -> Element<'_, Message> {

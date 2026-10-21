@@ -149,7 +149,7 @@ impl OutputMode {
     }
 
     /// Sink port this mode forces, if any. `Auto` lets the driver choose.
-    const fn forced_port(self) -> Option<&'static str> {
+    pub(crate) const fn forced_port(self) -> Option<&'static str> {
         match self {
             Self::Speakers => Some(PORT_LINE_OUT),
             Self::Headphones => Some(PORT_HEADPHONES),
