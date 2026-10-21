@@ -21,6 +21,8 @@ In COSMIC (and many distributions with PipeWire + ALSA + HDA drivers), the `Auto
 - Discovers the active analog sink (using `pactl list sinks`), respecting the default sink when available.
 - Reads which ALSA card backs that sink (`alsa.card`) to target the correct card mixer (avoids picking the wrong codec on multi-codec machines).
 - Switches the sink port (`pactl set-sink-port`) and sets `Auto-Mute Mode` on the real card mixer.
+- Carries the current volume level across a port switch. PipeWire keeps one volume per port, so without this the output would change level every time another port is forced.
+- In `Automático` mode the port is left exactly where it is and only `Auto-Mute Mode` is handed back to the driver, so the applet never moves the output behind your back.
 - Persists the last successful mode and restores it on startup (without touching hardware on first run if none is saved).
 
 ## Note on USB audio
@@ -76,6 +78,8 @@ Este applet:
 - Descubre el sink analógico activo (con `pactl list sinks`), respetando el sink por defecto cuando está disponible.
 - Lee qué tarjeta ALSA usa ese sink (`alsa.card`) para apuntar al mezclador correcto (evita elegir el codec equivocado en máquinas con varios codecs analógicos).
 - Cambia el puerto del sink (`pactl set-sink-port`) y ajusta `Auto-Mute Mode` en el mezclador de la tarjeta real.
+- Conserva el nivel de volumen al cambiar de puerto. PipeWire guarda un volumen por puerto, así que sin esto la salida cambiaría de nivel cada vez que se fuerza otro puerto.
+- En el modo `Automático` el puerto queda exactamente donde está y solo se le devuelve `Auto-Mute Mode` al driver, de modo que el applet nunca mueve la salida a tus espaldas.
 - Guarda el último modo elegido y lo restaura al iniciar, sin tocar el hardware en el primer arranque si no hay un modo guardado previamente.
 
 ## Nota sobre audio USB
