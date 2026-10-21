@@ -98,6 +98,12 @@ pub struct AppModel {
     last_forced_apply: Option<Instant>,
     /// The port we most recently forced, to detect real flips.
     last_forced_port: Option<String>,
+    /// Consecutive polls seeing an incorrect port.
+    wrong_count: u8,
+    /// Port seen as wrong across consecutive polls.
+    wrong_port: Option<String>,
+    /// When the current mismatch started.
+    mismatch_since: Option<Instant>,
 }
 
 impl Default for AppModel {
@@ -111,6 +117,9 @@ impl Default for AppModel {
             restore: None,
             last_forced_apply: None,
             last_forced_port: None,
+            wrong_count: 0,
+            wrong_port: None,
+            mismatch_since: None,
         }
     }
 }
@@ -122,33 +131,67 @@ impl AppModel {
     /// kicked in after volume changes), re-apply that forced mode to keep the
     /// hardware in sync with the UI.
     ///
-    /// Throttle re-applies to avoid fighting volume slider changes.
+    /// Use hysteresis to avoid fighting transient jack sense flips on volume changes.
     fn refresh(&mut self) {
         self.active_port = audio::active_port().ok().flatten();
 
         if matches!(self.mode, OutputMode::Auto) {
+            self.wrong_count = 0;
+            self.wrong_port = None;
+            self.mismatch_since = None;
             return;
         }
 
         if let Some(forced) = self.mode.forced_port() {
-            // If we just forced it, or it's been less than 1s, don't fight it
-            if let Some(last) = self.last_forced_apply {
-                if last.elapsed() < Duration::from_secs(2) {
-                    return;
-                }
-            }
-            // Only re-apply if the port actually changed from what we last forced
-            if self.last_forced_port.as_deref() == self.active_port.as_deref() {
+            let active = self.active_port.as_deref();
+
+            // Already at our forced port, or driver chose same port as forced
+            if active == Some(forced) || self.last_forced_port.as_deref() == active {
+                self.wrong_count = 0;
+                self.wrong_port = None;
+                self.mismatch_since = None;
+                self.last_forced_port = Some(forced.to_string());
                 return;
             }
-            if self.active_port.as_deref() != Some(forced) {
-                let _ = audio::apply(self.mode);
-                self.last_forced_apply = Some(Instant::now());
-                self.last_forced_port = Some(forced.to_string());
-                self.active_port = audio::active_port().ok().flatten();
-            } else {
-                self.last_forced_port = Some(forced.to_string());
+
+            // Port doesn't match forced port - check if it's a persistent flip
+            if active != Some(forced) {
+                // If we just applied a forced mode, give the hardware time to settle
+                if let Some(last) = self.last_forced_apply {
+                    if last.elapsed() < Duration::from_secs(3) {
+                        return;
+                    }
+                }
+
+                // Track consecutive wrong ports
+                if self.wrong_port.as_deref() == active {
+                    self.wrong_count = self.wrong_count.saturating_add(1);
+                } else {
+                    self.wrong_port = active.map(|s| s.to_string());
+                    self.wrong_count = 1;
+                    self.mismatch_since = Some(Instant::now());
+                }
+
+                // Only re-apply if mismatch has persisted for long enough
+                // and we've seen it for multiple consecutive polls
+                if self.wrong_count >= 2 {
+                    if let Some(since) = self.mismatch_since {
+                        if since.elapsed() >= Duration::from_millis(1500) {
+                            let _ = audio::apply(self.mode);
+                            self.last_forced_apply = Some(Instant::now());
+                            self.last_forced_port = Some(forced.to_string());
+                            self.active_port = audio::active_port().ok().flatten();
+                            self.wrong_count = 0;
+                            self.wrong_port = None;
+                            self.mismatch_since = None;
+                            return;
+                        }
+                    }
+                }
+                return;
             }
+
+            self.last_forced_port = Some(forced.to_string());
         }
     }
 
@@ -169,6 +212,9 @@ impl AppModel {
     /// events on some HDA codecs.
     fn set_mode(&mut self, mode: OutputMode) {
         self.mode = mode;
+        self.wrong_count = 0;
+        self.wrong_port = None;
+        self.mismatch_since = None;
         let result = match mode {
             OutputMode::Auto => Ok(()),
             other => {
