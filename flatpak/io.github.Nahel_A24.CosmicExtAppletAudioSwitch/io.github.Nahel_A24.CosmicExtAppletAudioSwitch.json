@@ -31,8 +31,14 @@
       "buildsystem": "simple",
       "build-commands": [
         "cargo --offline fetch --manifest-path Cargo.toml --verbose",
-        "just build-release --offline --locked",
-        "just prefix=/app install"
+        "cargo --offline build --release --locked",
+        "install -Dm0755 target/release/cosmic-ext-applet-audio-switch /app/bin/cosmic-ext-applet-audio-switch",
+        "install -Dm0644 data/io.github.Nahel_A24.CosmicExtAppletAudioSwitch.desktop /app/share/applications/io.github.Nahel_A24.CosmicExtAppletAudioSwitch.desktop",
+        "install -Dm0644 data/io.github.Nahel_A24.CosmicExtAppletAudioSwitch.metainfo.xml /app/share/metainfo/io.github.Nahel_A24.CosmicExtAppletAudioSwitch.metainfo.xml",
+        "install -Dm0644 data/icons/hicolor/scalable/apps/io.github.Nahel_A24.CosmicExtAppletAudioSwitch.svg /app/share/icons/hicolor/scalable/apps/io.github.Nahel_A24.CosmicExtAppletAudioSwitch.svg",
+        "install -Dm0644 data/icons/hicolor/scalable/devices/speaker-symbolic.svg /app/share/icons/hicolor/scalable/devices/speaker-symbolic.svg",
+        "install -Dm0644 data/icons/hicolor/scalable/devices/audio-headphones-symbolic.svg /app/share/icons/hicolor/scalable/devices/audio-headphones-symbolic.svg",
+        "install -Dm0644 data/icons/hicolor/scalable/actions/object-select-symbolic.svg /app/share/icons/hicolor/scalable/actions/object-select-symbolic.svg"
       ],
       "sources": [
         {
