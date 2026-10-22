@@ -21,11 +21,14 @@
 //!   port still has to be read from the sink list.
 
 use std::io::{BufRead, BufReader};
+use std::pin::Pin;
 use std::process::{Child, ChildStdout, Command, Stdio};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use cosmic::iced::Subscription;
 use futures::channel::mpsc::UnboundedSender;
+use futures::Stream;
 
 /// A change reported on a sink.
 ///
@@ -65,16 +68,47 @@ pub fn subscription() -> Subscription<SinkEvent> {
 
 /// The stream of sink events.
 ///
-/// The watcher task owns the child process, so dropping it (when the applet
-/// goes away) kills the child instead of leaving it behind.
-fn events() -> impl futures::Stream<Item = SinkEvent> + Send + 'static {
+/// The stream owns the watcher task: dropping it (when the applet goes away)
+/// aborts the task, which drops its future, which drops the [`Subscriber`],
+/// which kills the child instead of leaving it behind.
+fn events() -> EventStream {
     let (sender, receiver) = futures::channel::mpsc::unbounded::<SinkEvent>();
 
-    tokio::task::spawn(async move {
+    let task = tokio::task::spawn(async move {
         watch(sender).await;
     });
 
-    receiver
+    EventStream { receiver, task }
+}
+
+/// The sink events and the task that produces them.
+///
+/// The task is what keeps the child process from outliving the applet: it
+/// owns the [`Subscriber`], and this stream owns the task, so dropping the
+/// stream aborts the task and the subscriber's `Drop` kills the child.
+struct EventStream {
+    /// The events the watcher reports.
+    receiver: futures::channel::mpsc::UnboundedReceiver<SinkEvent>,
+    /// The task that watches the subscriber.
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Stream for EventStream {
+    type Item = SinkEvent;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+
+        Pin::new(&mut this.receiver).poll_next(cx)
+    }
+}
+
+impl Drop for EventStream {
+    fn drop(&mut self) {
+        // Aborting the task drops its future, which drops the subscriber,
+        // which kills the child: nobody is listening for the events any more.
+        self.task.abort();
+    }
 }
 
 /// Keeps a subscriber alive and forwards the sink events it reports.
@@ -419,6 +453,56 @@ mod tests {
         // waiting for a process that is not there any more.
         read_events(BufReader::new(stdout), sender);
 
+        assert!(receiver.try_recv().is_err(), "no event was reported");
+    }
+
+    #[test]
+    fn dropping_the_stream_kills_the_process_its_task_owns() {
+        // The promise the module makes: the child dies with the stream. The
+        // task is what owns the subscriber, so dropping the stream has to
+        // abort the task — a detached task would leave the child behind.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("the runtime must start");
+
+        let (program, args) = fake_subscriber("exec sleep 5");
+
+        let mut subscriber = Subscriber::spawn(program, &args).expect("the subscriber must start");
+        let stdout = subscriber
+            .take_stdout()
+            .expect("the subscriber must have a pipe");
+
+        runtime.block_on(async {
+            let (_sender, receiver) = futures::channel::mpsc::unbounded();
+
+            let task = tokio::task::spawn(async move {
+                // The subscriber lives as long as the task: aborting the task
+                // drops it, and its `Drop` kills the child.
+                let _subscriber = subscriber;
+
+                std::future::pending::<()>().await;
+            });
+
+            let stream = EventStream { receiver, task };
+
+            drop(stream);
+
+            // Give the runtime the chance to cancel the task and drop the
+            // future that owns the child.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        });
+
+        // The child is gone, so the pipe closed: the read ends instead of
+        // waiting for a process that is not there any more.
+        let started = std::time::Instant::now();
+        let (sender, mut receiver) = futures::channel::mpsc::unbounded();
+        read_events(BufReader::new(stdout), sender);
+
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the child must die with the task that owns it"
+        );
         assert!(receiver.try_recv().is_err(), "no event was reported");
     }
 }

@@ -11,6 +11,7 @@
 mod app;
 mod audio;
 mod control;
+mod i18n;
 mod shortcut;
 mod state;
 mod watch;

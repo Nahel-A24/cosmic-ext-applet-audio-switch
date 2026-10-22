@@ -22,7 +22,7 @@ use cosmic::theme;
 use cosmic::widget::{column, divider, icon, space, text, Row};
 use cosmic::Element;
 
-use crate::audio::{self, OutputMode};
+use crate::audio::{self, AudioError, OutputMode, SinkState};
 use crate::control;
 use crate::state;
 use crate::watch;
@@ -79,6 +79,28 @@ const APPLY_SETTLE: Duration = Duration::from_millis(500);
 /// rate bounded without dropping the event that carries the flip.
 const EVENT_DEBOUNCE: Duration = Duration::from_millis(50);
 
+/// How many times the port write is attempted before the correction gives up.
+///
+/// `pactl set-sink-port` is asynchronous: the server accepts the request and
+/// PipeWire applies the route change afterwards, so the port read back right
+/// after the write can still be the old one. The write is repeated until the
+/// read-back shows the forced port, but only a bounded number of times.
+const PORT_ATTEMPTS: usize = 3;
+
+/// How many times the level write is attempted before the correction gives up.
+///
+/// The level write is verified the same way the port write is: the sink is
+/// read back and the level is written again if the read-back does not show
+/// it, but only a bounded number of times.
+const LEVEL_ATTEMPTS: usize = 3;
+
+/// Pause between two attempts of the same write.
+///
+/// The read-back that follows a write already costs a process round trip, so
+/// this is only a short pause: long enough for the sound server to apply
+/// what was written, short enough to stay invisible.
+const RETRY_PAUSE: Duration = Duration::from_millis(5);
+
 /// A pending startup restore of the persisted output mode.
 ///
 /// Armed only from [`AppModel::init`]; user actions never create one, so a
@@ -124,9 +146,10 @@ enum Correction {
     /// The driver moved the port: it has to be moved back.
     ///
     /// `level` is the level the sink is showing right now, and it has to go
-    /// back with the port: PipeWire keeps one level per port, so the port
-    /// write alone would leave the sink showing the forced port's stale level
-    /// and the slider would jump under the user's finger.
+    /// back with the port: the level the sink shows belongs to the route it
+    /// is on, so the port write alone would leave the sink showing the level
+    /// stored for the forced port, and the slider would jump under the user's
+    /// finger.
     ///
     /// `None` means no level could be read, and then no level is written: a
     /// level is never guessed.
@@ -182,6 +205,199 @@ fn refresh_due(elapsed: Option<Duration>) -> bool {
     elapsed.map(|since| since >= EVENT_DEBOUNCE).unwrap_or(true)
 }
 
+/// Is the sink playing through the port this mode forces?
+///
+/// A forced mode that is in place means the applet's own write landed: the
+/// settle window only covers the transient *before* the write lands, so it
+/// ends there and a flip that comes later is corrected right away.
+fn port_landed(mode: OutputMode, active: Option<&str>) -> bool {
+    match (mode.forced_port(), active) {
+        (Some(forced), Some(active)) => forced == active,
+        _ => false,
+    }
+}
+
+/// The sound stack the correction writes to.
+///
+/// The correction is a sequence — write the port, read it back, write the
+/// level, read it back — and the sequence is exactly the part that has to be
+/// right: a level written before the port write landed lands on the route the
+/// sink is not listening through. The trait keeps that sequence testable
+/// without a sound server.
+trait SoundStack {
+    /// Writes the port this mode forces.
+    fn write_port(&mut self, sink: &str, mode: OutputMode) -> Result<(), AudioError>;
+
+    /// Writes a level onto the sink's active route.
+    fn write_level(&mut self, sink: &str, percent: u32) -> Result<(), AudioError>;
+
+    /// Reads the sink's live state back.
+    fn read_state(&mut self) -> Result<SinkState, AudioError>;
+}
+
+/// The live sound stack: the `pactl` calls of [`crate::audio`].
+struct AudioStack;
+
+impl SoundStack for AudioStack {
+    fn write_port(&mut self, sink: &str, mode: OutputMode) -> Result<(), AudioError> {
+        audio::apply_port(sink, mode)
+    }
+
+    fn write_level(&mut self, sink: &str, percent: u32) -> Result<(), AudioError> {
+        audio::set_volume(sink, percent)
+    }
+
+    fn read_state(&mut self) -> Result<SinkState, AudioError> {
+        audio::sink_state()
+    }
+}
+
+/// Why a correction could not be completed.
+///
+/// A failed correction is reported in the popup: the icon would otherwise
+/// claim a port the audio is not coming out of.
+#[derive(Debug)]
+enum CorrectionError {
+    /// The port write failed, or the sink could not be read back.
+    Port(AudioError),
+    /// The port write did not land: the sink kept reporting another port.
+    PortNotApplied,
+    /// The level write failed, or the sink could not be read back.
+    Level(AudioError),
+    /// The level write did not land: the sink kept reporting another level.
+    LevelNotApplied,
+}
+
+impl std::fmt::Display for CorrectionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Port(error) => {
+                if crate::i18n::is_spanish() {
+                    write!(f, "no se pudo forzar el puerto: {error}")
+                } else {
+                    write!(f, "could not force the port: {error}")
+                }
+            }
+            Self::PortNotApplied => {
+                if crate::i18n::is_spanish() {
+                    write!(f, "el puerto forzado no llegó a aplicarse")
+                } else {
+                    write!(f, "the forced port did not apply")
+                }
+            }
+            Self::Level(error) => {
+                if crate::i18n::is_spanish() {
+                    write!(f, "no se pudo restaurar el nivel: {error}")
+                } else {
+                    write!(f, "could not restore the level: {error}")
+                }
+            }
+            Self::LevelNotApplied => {
+                if crate::i18n::is_spanish() {
+                    write!(f, "el nivel no llegó a restaurarse")
+                } else {
+                    write!(f, "the level did not restore")
+                }
+            }
+        }
+    }
+}
+
+impl std::error::Error for CorrectionError {}
+
+/// Puts the forced port back and restores the level the sink was showing.
+///
+/// The writes are a verified, bounded transaction:
+///
+/// 1. The port is written.
+/// 2. The sink is read back. `pactl set-sink-port` is asynchronous — the
+///    server accepts the request and PipeWire applies the route afterwards —
+///    so the read-back can still report the old port. The port is written
+///    again, at most `PORT_ATTEMPTS` times in total.
+/// 3. Only once the read-back shows the forced port is the level written:
+///    the level observed in this refresh, never a remembered one and never a
+///    guessed one.
+/// 4. The sink is read back again, and the level is written again if the
+///    read-back does not show it, at most `LEVEL_ATTEMPTS` times in total.
+///
+/// A failed write stops the sequence and is reported: a level written after a
+/// failed port write would land on a route the user is not listening through.
+fn correct_port(
+    stack: &mut impl SoundStack,
+    sink: &str,
+    mode: OutputMode,
+    level: Option<u32>,
+) -> Result<(), CorrectionError> {
+    // `Auto` forces no port, so nothing is written at all: neither the port
+    // nor the level.
+    let Some(forced) = mode.forced_port() else {
+        return Ok(());
+    };
+
+    // The port write, verified by the read-back that follows it.
+    let mut applied = false;
+
+    for attempt in 1..=PORT_ATTEMPTS {
+        stack
+            .write_port(sink, mode)
+            .map_err(CorrectionError::Port)?;
+
+        let state = stack.read_state().map_err(CorrectionError::Port)?;
+
+        if matches!(state.port.as_deref(), Some(active) if active == forced) {
+            applied = true;
+            break;
+        }
+
+        if attempt < PORT_ATTEMPTS {
+            std::thread::sleep(RETRY_PAUSE);
+        }
+    }
+
+    if !applied {
+        return Err(CorrectionError::PortNotApplied);
+    }
+
+    // The level write, verified the same way. Without an observed level there
+    // is nothing to restore: a level is never guessed.
+    let Some(level) = level else {
+        return Ok(());
+    };
+
+    let mut restored = false;
+
+    for attempt in 1..=LEVEL_ATTEMPTS {
+        stack
+            .write_level(sink, level)
+            .map_err(CorrectionError::Level)?;
+
+        let state = stack.read_state().map_err(CorrectionError::Level)?;
+
+        if level_landed(state.volume, level) {
+            restored = true;
+            break;
+        }
+
+        if attempt < LEVEL_ATTEMPTS {
+            std::thread::sleep(RETRY_PAUSE);
+        }
+    }
+
+    if !restored {
+        return Err(CorrectionError::LevelNotApplied);
+    }
+
+    Ok(())
+}
+
+/// Has the level the sink shows reached the one that was written?
+///
+/// The percentage is rounded for the display, so a level that did land is
+/// allowed to be off by one.
+fn level_landed(shown: Option<u32>, written: u32) -> bool {
+    matches!(shown, Some(shown) if shown.abs_diff(written) <= 1)
+}
+
 /// Application state.
 pub struct AppModel {
     core: Core,
@@ -189,7 +405,7 @@ pub struct AppModel {
     mode: OutputMode,
     /// Sink port reported by `pactl list sinks` at the last refresh.
     active_port: Option<String>,
-    /// Last error from the audio backend, if any.
+    /// Last error from the audio backend or from a failed correction, if any.
     error: Option<String>,
     /// Startup-only retry of the persisted mode, while the sound stack comes up.
     restore: Option<Restore>,
@@ -231,11 +447,17 @@ impl AppModel {
     /// 2. A port the driver moved on its own is corrected.
     ///
     /// The correction writes the port and the level the sink is showing right
-    /// now, and nothing else. PipeWire keeps one level per port, so the port
-    /// write alone would leave the sink showing the forced port's stale level
-    /// and the slider would jump under the user's finger. What must *not* be
-    /// written is a remembered level: the level the user just chose is the one
-    /// the sink is showing, and that is the one that goes back.
+    /// now, and nothing else. The level the sink shows belongs to the route
+    /// it is on, so the port write alone would leave the sink showing the
+    /// level stored for the forced port and the slider would jump under the
+    /// user's finger. What must *not* be written is a remembered level: the
+    /// level the user just chose is the one the sink is showing, and that is
+    /// the one that goes back.
+    ///
+    /// Both writes are verified: the port is only followed by the level once
+    /// the sink reports the forced port, and the level is written again if
+    /// the read-back does not show it. A failed write is reported in
+    /// [`Self::error`] instead of being swallowed.
     fn refresh(&mut self) {
         self.last_refresh = Some(Instant::now());
 
@@ -244,6 +466,15 @@ impl AppModel {
 
         if self.mode.forced_port().is_none() {
             return;
+        }
+
+        // The applet's own write has landed once the sink reports the forced
+        // port. The settle window only covers the transient *before* the
+        // write lands — the sink list can still report the old port right
+        // after it — so it ends here, and a flip that comes later is
+        // corrected right away instead of waiting for the next poll.
+        if port_landed(self.mode, self.active_port.as_deref()) {
+            self.last_forced_apply = None;
         }
 
         // The driver can switch `Auto-Mute Mode` back on by itself, and a
@@ -270,25 +501,31 @@ impl AppModel {
             Correction::Keep | Correction::Wait => {}
             Correction::Move { level } => {
                 let Some(sink) = state.name.as_deref() else {
+                    // There is no sink to address: the correction cannot even
+                    // be attempted, and the applet has to say so.
+                    self.error = Some(CorrectionError::Port(AudioError::NoAnalogSink).to_string());
                     return;
                 };
 
-                // The port comes first: the level is written onto the port the
-                // sink is on after that write.
-                let _ = audio::apply_port(sink, self.mode);
+                match correct_port(&mut AudioStack, sink, self.mode, level) {
+                    Ok(()) => {
+                        // The port was written and the read-back confirmed it,
+                        // so nothing has to settle any more: a flip that comes
+                        // later is corrected right away.
+                        self.last_forced_apply = None;
+                    }
+                    Err(error) => {
+                        // A failed correction has to be visible: the icon
+                        // would otherwise claim a port the audio is not
+                        // coming out of.
+                        self.error = Some(error.to_string());
 
-                // The level is restored onto the port the sink is on now, so
-                // the correction leaves the sink showing what it was showing.
-                // Without a level there is nothing to restore: a level is
-                // never guessed.
-                if let Some(level) = level {
-                    let _ = audio::set_volume(sink, level);
+                        // The port was written all the same, so the hardware
+                        // gets the settle window before the next attempt: a
+                        // driver that refuses the port must not be hammered.
+                        self.last_forced_apply = Some(Instant::now());
+                    }
                 }
-
-                // This write is the applet's own, so the settle window starts
-                // over: the sink list can still report the old port right
-                // after it.
-                self.last_forced_apply = Some(Instant::now());
             }
         }
     }
@@ -670,12 +907,123 @@ mod tests {
     const LINE_OUT: &str = "analog-output-lineout";
     const HEADPHONES: &str = "analog-output-headphones";
 
+    /// The sink the correction writes to.
+    const SINK: &str = "alsa_output.pci-0000_00_1f.3.analog-stereo";
+
     /// A level the sink could be showing.
     const LEVEL: Option<u32> = Some(62);
 
     /// Time since the applet's own write, once the hardware has settled.
     fn settled_ago() -> Duration {
         APPLY_SETTLE + Duration::from_millis(1)
+    }
+
+    /// A sink state the fake sound stack reports.
+    fn state_on(port: &str, volume: Option<u32>) -> SinkState {
+        SinkState {
+            name: Some(SINK.to_owned()),
+            port: Some(port.to_owned()),
+            volume,
+        }
+    }
+
+    /// One call the correction made.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum Call {
+        /// The port was written.
+        Port,
+        /// The level was written.
+        Level(u32),
+        /// The sink was read back.
+        Read,
+    }
+
+    /// A sound stack that records what the correction writes.
+    ///
+    /// The read-backs are scripted: the fake hands out the states in `reads`
+    /// in order and repeats the last one once they run out, which is how a
+    /// sink behaves once it stopped changing.
+    struct FakeStack {
+        /// Every call the correction made, in order.
+        calls: Vec<Call>,
+        /// The states the read-backs report.
+        reads: Vec<SinkState>,
+        /// Whether the port write fails.
+        port_fails: bool,
+        /// Whether the level write fails.
+        level_fails: bool,
+    }
+
+    impl FakeStack {
+        /// A stack whose read-backs report the given states, in order.
+        fn new(reads: Vec<SinkState>) -> Self {
+            Self {
+                calls: Vec::new(),
+                reads,
+                port_fails: false,
+                level_fails: false,
+            }
+        }
+
+        /// The next state the read-back reports.
+        fn next_state(&mut self) -> SinkState {
+            self.calls.push(Call::Read);
+
+            if self.reads.len() > 1 {
+                self.reads.remove(0)
+            } else {
+                self.reads.first().cloned().unwrap_or_default()
+            }
+        }
+
+        /// The levels the correction wrote, in order.
+        fn level_writes(&self) -> Vec<u32> {
+            self.calls
+                .iter()
+                .filter_map(|call| match call {
+                    Call::Level(level) => Some(*level),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        /// The number of port writes the correction made.
+        fn port_writes(&self) -> usize {
+            self.calls
+                .iter()
+                .filter(|call| **call == Call::Port)
+                .count()
+        }
+    }
+
+    impl SoundStack for FakeStack {
+        fn write_port(&mut self, _sink: &str, _mode: OutputMode) -> Result<(), AudioError> {
+            self.calls.push(Call::Port);
+
+            if self.port_fails {
+                Err(AudioError::Spawn(std::io::Error::other(
+                    "the port write failed",
+                )))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn write_level(&mut self, _sink: &str, percent: u32) -> Result<(), AudioError> {
+            self.calls.push(Call::Level(percent));
+
+            if self.level_fails {
+                Err(AudioError::Spawn(std::io::Error::other(
+                    "the level write failed",
+                )))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn read_state(&mut self) -> Result<SinkState, AudioError> {
+            Ok(self.next_state())
+        }
     }
 
     #[test]
@@ -782,6 +1130,170 @@ mod tests {
         assert!(settled(None), "nothing was applied, nothing to wait for");
         assert!(settled(Some(APPLY_SETTLE)));
         assert!(!settled(Some(APPLY_SETTLE - Duration::from_millis(1))));
+    }
+
+    #[test]
+    fn the_settle_window_ends_when_the_forced_port_is_observed() {
+        // The applet's own write landed: the window exists only for the
+        // transient before it landed, so it ends there and a flip that comes
+        // later is corrected right away.
+        assert!(port_landed(OutputMode::Speakers, Some(LINE_OUT)));
+        assert!(port_landed(OutputMode::Headphones, Some(HEADPHONES)));
+
+        assert!(
+            !port_landed(OutputMode::Speakers, Some(HEADPHONES)),
+            "the driver moved the port: the write did not land"
+        );
+        assert!(
+            !port_landed(OutputMode::Auto, Some(LINE_OUT)),
+            "auto forces no port, so nothing was written"
+        );
+    }
+
+    #[test]
+    fn the_port_is_written_before_the_level() {
+        let mut stack = FakeStack::new(vec![state_on(LINE_OUT, LEVEL)]);
+
+        correct_port(&mut stack, SINK, OutputMode::Speakers, LEVEL)
+            .expect("the correction must succeed");
+
+        assert_eq!(
+            stack.calls,
+            vec![Call::Port, Call::Read, Call::Level(62), Call::Read,],
+            "the port has to be written — and confirmed — before the level"
+        );
+    }
+
+    #[test]
+    fn a_failed_port_write_leaves_the_level_alone_and_is_reported() {
+        // A level written after a failed port write lands on a route the
+        // user is not listening through.
+        let mut stack = FakeStack::new(vec![state_on(LINE_OUT, LEVEL)]);
+        stack.port_fails = true;
+
+        let error = correct_port(&mut stack, SINK, OutputMode::Speakers, LEVEL)
+            .expect_err("the failed write must be reported");
+
+        assert!(matches!(error, CorrectionError::Port(_)), "{error}");
+        assert!(
+            stack.level_writes().is_empty(),
+            "the level must not be written after a failed port write"
+        );
+    }
+
+    #[test]
+    fn the_level_is_written_only_after_the_forced_port_is_confirmed() {
+        // The first read-back still reports the old port: the write has not
+        // landed yet, so the level must not be written onto that route.
+        let mut stack =
+            FakeStack::new(vec![state_on(HEADPHONES, LEVEL), state_on(LINE_OUT, LEVEL)]);
+
+        correct_port(&mut stack, SINK, OutputMode::Speakers, LEVEL)
+            .expect("the correction must succeed");
+
+        assert_eq!(
+            stack.calls,
+            vec![
+                Call::Port,
+                Call::Read,
+                Call::Port,
+                Call::Read,
+                Call::Level(62),
+                Call::Read,
+            ],
+            "the level must wait for the read-back that shows the forced port"
+        );
+    }
+
+    #[test]
+    fn the_port_write_gives_up_after_the_attempt_budget() {
+        // The sink keeps reporting the old port: the write is repeated a
+        // bounded number of times and then reported.
+        let mut stack = FakeStack::new(vec![state_on(HEADPHONES, LEVEL)]);
+
+        let error = correct_port(&mut stack, SINK, OutputMode::Speakers, LEVEL)
+            .expect_err("the failed correction must be reported");
+
+        assert!(matches!(error, CorrectionError::PortNotApplied), "{error}");
+        assert_eq!(stack.port_writes(), PORT_ATTEMPTS);
+        assert!(
+            stack.level_writes().is_empty(),
+            "no level may be written while the port did not land"
+        );
+    }
+
+    #[test]
+    fn the_level_is_written_again_until_the_read_back_shows_it() {
+        // The level write is verified too: the read-back keeps reporting the
+        // level the forced port had stored until the write lands.
+        let mut stack = FakeStack::new(vec![
+            state_on(LINE_OUT, Some(35)),
+            state_on(LINE_OUT, Some(35)),
+            state_on(LINE_OUT, LEVEL),
+        ]);
+
+        correct_port(&mut stack, SINK, OutputMode::Speakers, LEVEL)
+            .expect("the correction must succeed");
+
+        assert_eq!(
+            stack.level_writes(),
+            vec![62, 62],
+            "the level must be written again when the read-back does not show it"
+        );
+    }
+
+    #[test]
+    fn the_level_write_gives_up_after_the_attempt_budget() {
+        // The sink keeps reporting another level: the correction must stop
+        // instead of writing forever.
+        let mut stack = FakeStack::new(vec![state_on(LINE_OUT, Some(35))]);
+
+        let error = correct_port(&mut stack, SINK, OutputMode::Speakers, LEVEL)
+            .expect_err("the failed restore must be reported");
+
+        assert!(matches!(error, CorrectionError::LevelNotApplied), "{error}");
+        assert_eq!(stack.level_writes().len(), LEVEL_ATTEMPTS);
+    }
+
+    #[test]
+    fn a_failed_level_write_is_reported() {
+        let mut stack = FakeStack::new(vec![state_on(LINE_OUT, LEVEL)]);
+        stack.level_fails = true;
+
+        let error = correct_port(&mut stack, SINK, OutputMode::Speakers, LEVEL)
+            .expect_err("the failed write must be reported");
+
+        assert!(matches!(error, CorrectionError::Level(_)), "{error}");
+    }
+
+    #[test]
+    fn the_correction_writes_no_level_without_an_observed_one() {
+        // A level is never guessed: without one the correction moves the port
+        // and leaves the level alone.
+        let mut stack = FakeStack::new(vec![state_on(LINE_OUT, LEVEL)]);
+
+        correct_port(&mut stack, SINK, OutputMode::Speakers, None)
+            .expect("the correction must succeed");
+
+        assert!(
+            stack.level_writes().is_empty(),
+            "without an observed level there is nothing to restore"
+        );
+    }
+
+    #[test]
+    fn auto_writes_nothing_at_all() {
+        // `Auto` hands arbitration back to the driver: neither the port nor
+        // the level is written.
+        let mut stack = FakeStack::new(vec![state_on(HEADPHONES, LEVEL)]);
+
+        correct_port(&mut stack, SINK, OutputMode::Auto, LEVEL).expect("auto must not fail");
+
+        assert!(
+            stack.calls.is_empty(),
+            "auto must not write anything: {:?}",
+            stack.calls
+        );
     }
 
     #[test]

@@ -21,9 +21,14 @@ In COSMIC (and many distributions with PipeWire + ALSA + HDA drivers), the `Auto
 - Discovers the active analog sink (using `pactl list sinks`), respecting the default sink when available.
 - Reads which ALSA card backs that sink (`alsa.card`) to target the correct card mixer (avoids picking the wrong codec on multi-codec machines).
 - Switches the sink port (`pactl set-sink-port`) and sets `Auto-Mute Mode` on the real card mixer.
-- Carries the current volume level across a port switch. PipeWire keeps one volume per port, so without this the output would change level every time another port is forced.
+- Carries the current volume level across a port switch. The level the sink shows belongs to the route it is on, so forcing a port makes it show the level stored for that port; the applet writes the level back, so the switch is inaudible.
 - In `Automático` mode the port is left exactly where it is and only `Auto-Mute Mode` is handed back to the driver, so the applet never moves the output behind your back.
 - Persists the last successful mode and restores it on startup (without touching hardware on first run if none is saved).
+- Holds the port it was asked for: if the driver moves the output to another port, the applet puts it back within a few tens of milliseconds and writes the level the sink was showing, so the volume that was set survives the switch. In `Automático` mode nothing is written at all — neither the port nor the level.
+
+## What the applet can and cannot do
+
+The applet **holds** the port, but it cannot **own** it: the desktop's own sound settings reset the sink's route whenever they change the volume, and no panel applet can prevent that. What the applet does is put the port back within a few tens of milliseconds — fast enough that the change is not audible — but it cannot stop the route from being reset in the first place.
 
 ## Note on USB audio
 
@@ -78,9 +83,14 @@ Este applet:
 - Descubre el sink analógico activo (con `pactl list sinks`), respetando el sink por defecto cuando está disponible.
 - Lee qué tarjeta ALSA usa ese sink (`alsa.card`) para apuntar al mezclador correcto (evita elegir el codec equivocado en máquinas con varios codecs analógicos).
 - Cambia el puerto del sink (`pactl set-sink-port`) y ajusta `Auto-Mute Mode` en el mezclador de la tarjeta real.
-- Conserva el nivel de volumen al cambiar de puerto. PipeWire guarda un volumen por puerto, así que sin esto la salida cambiaría de nivel cada vez que se fuerza otro puerto.
+- Conserva el nivel de volumen al cambiar de puerto. El nivel que muestra el sink pertenece a la ruta en la que está, así que forzar un puerto hace que muestre el nivel guardado para ese puerto; el applet vuelve a escribir el nivel, de modo que el cambio es inaudible.
 - En el modo `Automático` el puerto queda exactamente donde está y solo se le devuelve `Auto-Mute Mode` al driver, de modo que el applet nunca mueve la salida a tus espaldas.
 - Guarda el último modo elegido y lo restaura al iniciar, sin tocar el hardware en el primer arranque si no hay un modo guardado previamente.
+- Mantiene el puerto que se le pidió: si el driver mueve la salida a otro puerto, el applet lo vuelve a poner en su sitio en decenas de milisegundos y escribe el nivel que mostraba el sink, de modo que el volumen que se había ajustado se conserva. En el modo `Automático` no se escribe nada: ni el puerto ni el nivel.
+
+## Lo que el applet puede y lo que no puede hacer
+
+El applet **mantiene** el puerto, pero no puede **poseerlo**: los ajustes de sonido del escritorio reinician la ruta del sink cada vez que cambian el volumen, y ningún applet del panel puede evitarlo. Lo que hace el applet es devolver el puerto a su sitio en decenas de milisegundos, lo bastante rápido como para que el cambio sea inaudible, pero no puede impedir que la ruta se reinicie en primer lugar.
 
 ## Nota sobre audio USB
 

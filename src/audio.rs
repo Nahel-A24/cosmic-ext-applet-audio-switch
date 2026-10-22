@@ -20,6 +20,7 @@
 //! not localized, unlike `pactl` output, so they are matched verbatim.
 
 use std::process::Command;
+use std::time::Duration;
 
 use alsa::mixer::{Mixer, SelemChannelId, SelemId};
 
@@ -36,6 +37,13 @@ const ANALOG_PORT_PREFIX: &str = "analog-output-";
 /// Name of the HDA driver control that arbitrates speakers vs headphones.
 const AUTO_MUTE_CONTROL: &str = "Auto-Mute Mode";
 
+/// How long the route change is given to land before the sink is read again.
+///
+/// The port write is asynchronous: the server accepts it and PipeWire applies
+/// the route change afterwards, so the sink list can still report the previous
+/// port right after the write.
+const PORT_SETTLE_PAUSE: Duration = Duration::from_millis(5);
+
 /// Channel names that mark a `pactl` line as carrying a live volume.
 ///
 /// The volume label itself is translated, but PulseAudio prints the channel
@@ -49,11 +57,23 @@ const VOLUME_CHANNEL_MARKERS: [&str; 3] = ["front-left:", "front-right:", "mono:
 /// their Spanish mode labels back instead of the raw ALSA identifier. An
 /// unexpected port is passed through unchanged rather than hidden, so the
 /// caption never claims a state the hardware is not in.
-pub fn port_label(port: &str) -> &str {
+pub fn port_label(port: &str) -> &'static str {
     match port {
-        PORT_HEADPHONES => "Auriculares",
-        PORT_LINE_OUT => "Parlantes",
-        other => other,
+        PORT_HEADPHONES => {
+            if crate::i18n::is_spanish() {
+                "Auriculares"
+            } else {
+                "Headphones"
+            }
+        }
+        PORT_LINE_OUT => {
+            if crate::i18n::is_spanish() {
+                "Parlantes"
+            } else {
+                "Speakers"
+            }
+        }
+        other => Box::leak(other.to_string().into_boxed_str()),
     }
 }
 
@@ -70,15 +90,14 @@ pub enum OutputMode {
 
 impl OutputMode {
     /// User-facing label.
-    ///
-    /// These three strings are the product's Spanish UI labels; every visible
-    /// string in the popup is Spanish, while code, comments and identifiers
-    /// stay English.
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Speakers => "Parlantes",
-            Self::Headphones => "Auriculares",
-            Self::Auto => "Automático",
+    pub fn label(self) -> &'static str {
+        match (self, crate::i18n::is_spanish()) {
+            (Self::Speakers, true) => "Parlantes",
+            (Self::Speakers, false) => "Speakers",
+            (Self::Headphones, true) => "Auriculares",
+            (Self::Headphones, false) => "Headphones",
+            (Self::Auto, true) => "Automático",
+            (Self::Auto, false) => "Auto",
         }
     }
 
@@ -197,6 +216,8 @@ pub enum AudioError {
     AutoMuteControlMissing,
     /// The control exists but exposes neither a `Disabled` nor an `Enabled` item.
     AutoMuteItemMissing { labels: Vec<String> },
+    /// The port write did not land: the sink kept reporting another port.
+    PortNotApplied { sink: String, port: String },
     /// An ALSA mixer call failed.
     Alsa(alsa::Error),
 }
@@ -204,27 +225,67 @@ pub enum AudioError {
 impl std::fmt::Display for AudioError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Spawn(err) => write!(f, "no se pudo ejecutar pactl: {err}"),
+            Self::Spawn(err) => {
+                if crate::i18n::is_spanish() {
+                    write!(f, "no se pudo ejecutar pactl: {err}")
+                } else {
+                    write!(f, "could not run pactl: {err}")
+                }
+            }
             Self::Command {
                 args,
                 status,
                 stderr,
-            } => write!(f, "pactl {args} falló ({status}): {}", stderr.trim()),
+            } => {
+                if crate::i18n::is_spanish() {
+                    write!(f, "pactl {args} falló ({status}): {}", stderr.trim())
+                } else {
+                    write!(f, "pactl {args} failed ({status}): {}", stderr.trim())
+                }
+            }
             Self::NoAnalogSink => {
-                write!(f, "no se encontró ningún sink con puertos analog-output-*")
+                if crate::i18n::is_spanish() {
+                    write!(f, "no se encontró ningún sink con puertos analog-output-*")
+                } else {
+                    write!(f, "no sink with analog-output-* ports found")
+                }
             }
             Self::AutoMuteControlMissing => {
-                write!(
-                    f,
-                    "el control ALSA '{AUTO_MUTE_CONTROL}' no existe en la tarjeta"
-                )
+                if crate::i18n::is_spanish() {
+                    write!(
+                        f,
+                        "el control ALSA '{AUTO_MUTE_CONTROL}' no existe en la tarjeta"
+                    )
+                } else {
+                    write!(
+                        f,
+                        "ALSA control '{AUTO_MUTE_CONTROL}' not found on this card"
+                    )
+                }
             }
-            Self::AutoMuteItemMissing { labels } => write!(
-                f,
-                "el control '{AUTO_MUTE_CONTROL}' no ofrece 'Disabled' ni 'Enabled' (items: {})",
-                labels.join(", ")
-            ),
-            Self::Alsa(err) => write!(f, "error de ALSA: {err}"),
+            Self::AutoMuteItemMissing { labels } => {
+                if crate::i18n::is_spanish() {
+                    write!(
+                        f,
+                        "el control '{AUTO_MUTE_CONTROL}' no ofrece 'Disabled' ni 'Enabled' (items: {})",
+                        labels.join(", ")
+                    )
+                } else {
+                    write!(
+                        f,
+                        "'{AUTO_MUTE_CONTROL}' has neither Disabled nor Enabled (items: {})",
+                        labels.join(", ")
+                    )
+                }
+            }
+            Self::PortNotApplied { sink, port } => {
+                if crate::i18n::is_spanish() {
+                    write!(f, "el puerto '{port}' no llegó a aplicarse en {sink}")
+                } else {
+                    write!(f, "port '{port}' did not apply to {sink}")
+                }
+            }
+            Self::Alsa(err) => write!(f, "ALSA error: {err}"),
         }
     }
 }
@@ -254,12 +315,28 @@ pub fn apply(mode: OutputMode) -> Result<(), AudioError> {
             // line-out (or moves the port back) as soon as the jack changes.
             set_auto_mute(false, sink.alsa_card)?;
 
-            // PipeWire stores one volume per port, so moving the port swaps the
-            // visible volume for the level stored on the target port. The
-            // volume is captured before the switch and written back onto the
-            // new port afterwards, so forcing an output never changes how loud
-            // the user hears it.
-            set_sink_port_on(&sink.name, port)?;
+            // The level the sink shows belongs to the route it is on, so
+            // moving the port swaps the visible level for the one stored for
+            // the target port. The level is captured before the switch and
+            // written back onto the new port afterwards, so forcing an output
+            // never changes how loud the user hears it.            set_sink_port_on(&sink.name, port)?;
+
+            // The port write is asynchronous: the server accepts the request
+            // and PipeWire applies the route change afterwards. Writing the
+            // level before the route has moved would put the level on the
+            // route the sink is leaving — the very jump this applet exists to
+            // avoid — so the level waits for the port to show up as the
+            // active one.
+            if !port_is_active(&sink.name, port)? {
+                std::thread::sleep(PORT_SETTLE_PAUSE);
+
+                if !port_is_active(&sink.name, port)? {
+                    return Err(AudioError::PortNotApplied {
+                        sink: sink.name.clone(),
+                        port: port.to_string(),
+                    });
+                }
+            }
 
             if let Some(percent) = sink.volume {
                 let _ = set_volume(&sink.name, percent);
@@ -267,6 +344,7 @@ pub fn apply(mode: OutputMode) -> Result<(), AudioError> {
 
             Ok(())
         }
+
         // `Auto` hands arbitration back to the driver: `Auto-Mute Mode` is
         // re-enabled and the port is left exactly where it is. Forcing a port
         // here would fight the driver on the next jack event, and switching
@@ -286,9 +364,10 @@ pub fn apply(mode: OutputMode) -> Result<(), AudioError> {
 /// This is the correction path, and it is deliberately narrower than
 /// [`apply`]: it writes the port and nothing else. The level is restored
 /// separately, by the caller, with the level the sink was showing *before*
-/// the port write — PipeWire keeps one level per port, so the port write
-/// alone would leave the sink showing the forced port's stale level. Writing
-/// a *remembered* level instead is what used to freeze the volume.
+/// the port write: the level the sink shows belongs to the route it is on, so
+/// the port write alone would leave the sink showing the level stored for the
+/// forced port. Writing a *remembered* level instead is what used to freeze
+/// the volume.
 ///
 /// `Auto` has no port to force, so it is a no-op: handing arbitration back to
 /// the driver is [`apply`]'s job, and forcing a port here would fight the
@@ -299,6 +378,16 @@ pub fn apply_port(sink: &str, mode: OutputMode) -> Result<(), AudioError> {
     };
 
     set_sink_port_on(sink, port)
+}
+
+/// Is the sink already playing through the given port?
+///
+/// The port write is asynchronous, so the sink list can still report the
+/// previous port right after it.
+fn port_is_active(sink: &str, port: &str) -> Result<bool, AudioError> {
+    let state = sink_state()?;
+
+    Ok(state.name.as_deref() == Some(sink) && state.port.as_deref() == Some(port))
 }
 
 /// Runs `pactl` with a forced C locale.
@@ -364,11 +453,12 @@ struct Sink {
     alsa_card: Option<i32>,
     /// Current sink volume, as a percentage of the base volume.
     ///
-    /// PipeWire keeps one volume per port, so this value belongs to the port
-    /// that is active right now. Moving the port swaps it for the value stored
-    /// on the target port, which is why a user-initiated switch has to carry
-    /// the volume across — and why a correction has to put the level it read
-    /// back onto the port it just moved to.
+    /// The level the sink shows belongs to the route it is on, so this value
+    /// belongs to the route that is active right now. Moving the port swaps
+    /// it for the value stored on the target port, which is why a
+    /// user-initiated switch has to carry the volume across — and why a
+    /// correction has to put the level it read back onto the port it just
+    /// moved to.
     volume: Option<u32>,
 }
 
@@ -620,8 +710,8 @@ pub struct SinkState {
     /// Level the sink is showing right now, as a percentage of the base
     /// volume.
     ///
-    /// PipeWire keeps one level per port, so this is the level of the port
-    /// that is active — the one the user is looking at.
+    /// The level the sink shows belongs to the route it is on, so this is the
+    /// level of the route that is active — the one the user is looking at.
     pub volume: Option<u32>,
 }
 
@@ -1153,9 +1243,14 @@ Destino #2
     }
 
     #[test]
-    fn maps_known_ports_to_their_spanish_labels() {
-        assert_eq!(port_label(PORT_HEADPHONES), "Auriculares");
-        assert_eq!(port_label(PORT_LINE_OUT), "Parlantes");
+    fn maps_known_ports_to_labels() {
+        if crate::i18n::is_spanish() {
+            assert_eq!(port_label(PORT_HEADPHONES), "Auriculares");
+            assert_eq!(port_label(PORT_LINE_OUT), "Parlantes");
+        } else {
+            assert_eq!(port_label(PORT_HEADPHONES), "Headphones");
+            assert_eq!(port_label(PORT_LINE_OUT), "Speakers");
+        }
     }
 
     #[test]
