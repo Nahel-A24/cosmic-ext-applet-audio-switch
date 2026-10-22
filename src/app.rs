@@ -3,6 +3,12 @@
 //! The panel shows a single icon button; clicking it opens a popup with the
 //! three actions. The icon and the highlighted action follow the selected mode,
 //! and the popup shows the sink's currently active port for reference.
+//!
+//! A forced mode is kept in force by watching the sound server's event
+//! stream: the driver moves the analog port on its own — the COSMIC panel's
+//! own volume control resets the sink's route, and PipeWire picks the other
+//! port a couple of milliseconds later — and the port has to be put back
+//! within milliseconds, not on the next poll.
 
 use std::time::{Duration, Instant};
 
@@ -19,6 +25,7 @@ use cosmic::Element;
 use crate::audio::{self, OutputMode};
 use crate::control;
 use crate::state;
+use crate::watch;
 /// Reverse-domain identifier of the applet.
 ///
 /// The underscore in the last segment is deliberate: Flatpak rejects an app ID
@@ -57,17 +64,20 @@ const RESTORE_DELAY: Duration = Duration::from_millis(400);
 /// hears the output move.
 const AUTO_MUTE_GUARD_INTERVAL: Duration = Duration::from_secs(15);
 
-/// How long a mismatch has to persist before the forced mode is re-applied.
+/// How long the hardware has to settle after the applet wrote the port itself.
 ///
-/// A volume change makes the driver report a port that is not the one in
-/// force for a moment. Re-applying on that transient is what used to fight
-/// the user's own volume control, so the mismatch has to hold still first.
-const MISMATCH_SETTLE: Duration = Duration::from_millis(1500);
+/// The write is asynchronous: the sink list can still report the previous
+/// port right after it. Correcting on that transient is what used to fight
+/// the user's own volume control, so the correction waits for the port to
+/// settle first.
+const APPLY_SETTLE: Duration = Duration::from_millis(500);
 
-/// How many consecutive polls have to see the same mismatch before it counts.
+/// Minimum time between two refreshes driven by sink events.
 ///
-/// One poll alone cannot tell a transient driver glitch from a real move.
-const MISMATCH_POLLS: u8 = 2;
+/// The events arrive in bursts — a single port change produces several of
+/// them — and every refresh costs two `pactl` calls. The window keeps that
+/// rate bounded without dropping the event that carries the flip.
+const EVENT_DEBOUNCE: Duration = Duration::from_millis(50);
 
 /// A pending startup restore of the persisted output mode.
 ///
@@ -102,6 +112,76 @@ impl Restore {
     }
 }
 
+/// What the applet has to do about the sink's active port.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Correction {
+    /// Nothing to do: the mode does not force a port, or the port in force is
+    /// already the active one.
+    Keep,
+    /// The applet wrote the port itself a moment ago, so the hardware has not
+    /// settled yet and the port has to be read again before correcting it.
+    Wait,
+    /// The driver moved the port: it has to be moved back.
+    ///
+    /// `level` is the level the sink is showing right now, and it has to go
+    /// back with the port: PipeWire keeps one level per port, so the port
+    /// write alone would leave the sink showing the forced port's stale level
+    /// and the slider would jump under the user's finger.
+    ///
+    /// `None` means no level could be read, and then no level is written: a
+    /// level is never guessed.
+    Move { level: Option<u32> },
+}
+
+/// Decides what to do about the active port.
+///
+/// `since_apply` is the time elapsed since the applet last wrote the port
+/// itself. The settle window exists because that write is asynchronous: the
+/// sink list can still report the previous port right after it, and a
+/// correction on that transient is what used to fight the user's own volume
+/// control.
+///
+/// `level` is the level the sink is showing right now. It is only carried by
+/// a [`Correction::Move`], because it is only written when the port moves.
+fn correction(
+    mode: OutputMode,
+    active: Option<&str>,
+    since_apply: Option<Duration>,
+    level: Option<u32>,
+) -> Correction {
+    let Some(forced) = mode.forced_port() else {
+        return Correction::Keep;
+    };
+
+    if active == Some(forced) {
+        return Correction::Keep;
+    }
+
+    if !settled(since_apply) {
+        return Correction::Wait;
+    }
+
+    Correction::Move { level }
+}
+
+/// Has the hardware settled since the applet's last write?
+///
+/// A mode that was never applied has nothing to wait for.
+fn settled(since_apply: Option<Duration>) -> bool {
+    since_apply
+        .map(|since| since >= APPLY_SETTLE)
+        .unwrap_or(true)
+}
+
+/// Is a refresh due, or did one run too recently?
+///
+/// `elapsed` is the time since the last refresh. A refresh that is too recent
+/// is deferred rather than dropped: dropping it would lose the very event
+/// that carries the flip.
+fn refresh_due(elapsed: Option<Duration>) -> bool {
+    elapsed.map(|since| since >= EVENT_DEBOUNCE).unwrap_or(true)
+}
+
 /// Application state.
 pub struct AppModel {
     core: Core,
@@ -113,22 +193,14 @@ pub struct AppModel {
     error: Option<String>,
     /// Startup-only retry of the persisted mode, while the sound stack comes up.
     restore: Option<Restore>,
-    /// When we last re-applied a forced mode to avoid fighting volume changes.
+    /// When the applet last wrote the port itself, forced or corrected.
     last_forced_apply: Option<Instant>,
-    /// The port we most recently forced, to detect real flips.
-    last_forced_port: Option<String>,
-    /// Consecutive polls seeing an incorrect port.
-    wrong_count: u8,
-    /// Port seen as wrong across consecutive polls.
-    wrong_port: Option<String>,
-    /// When the current mismatch started.
-    mismatch_since: Option<Instant>,
     /// When we last re-asserted that Auto-Mute stays disabled.
     last_auto_mute_guard: Option<Instant>,
-    /// Port seen on the previous poll, to notice the driver moving it.
-    last_seen_port: Option<String>,
-    /// Volume the user last chose, captured before the driver moves the port.
-    last_volume: Option<u32>,
+    /// When the last refresh ran, to keep the event-driven one bounded.
+    last_refresh: Option<Instant>,
+    /// Whether a deferred refresh is already pending.
+    refresh_scheduled: bool,
 }
 
 impl Default for AppModel {
@@ -141,75 +213,36 @@ impl Default for AppModel {
             error: None,
             restore: None,
             last_forced_apply: None,
-            last_forced_port: None,
-            wrong_count: 0,
-            wrong_port: None,
-            mismatch_since: None,
             last_auto_mute_guard: None,
-            last_seen_port: None,
-            last_volume: None,
+            last_refresh: None,
+            refresh_scheduled: false,
         }
     }
 }
 
 impl AppModel {
-    /// Re-reads the sink's active port and volume from `pactl`.
+    /// Re-reads the sink's active port from `pactl`.
     ///
-    /// Three things happen here, in order:
+    /// Two things happen here, in order:
     ///
-    /// 1. A port the driver moved on its own is noticed. PipeWire keeps one
-    ///    volume per port, so the level the user chose belongs to the port
-    ///    they just left; in `Auto` the driver owns the port and the level is
-    ///    carried over so the mixer never jumps.
-    /// 2. `Auto-Mute Mode` is re-asserted in a forced mode, because the driver
-    ///    turns it back on by itself and a forced port does not survive that.
-    /// 3. A forced mode whose port was overridden for good is re-applied.
+    /// 1. `Auto-Mute Mode` is re-asserted in a forced mode, because the
+    ///    driver turns it back on by itself and a forced port does not
+    ///    survive that.
+    /// 2. A port the driver moved on its own is corrected.
     ///
-    /// The re-apply waits for the mismatch to settle first: a volume change
-    /// makes the driver report a port that is not the one in force for a
-    /// moment, and re-applying on that transient is what used to fight the
-    /// user's own volume control.
+    /// The correction writes the port and the level the sink is showing right
+    /// now, and nothing else. PipeWire keeps one level per port, so the port
+    /// write alone would leave the sink showing the forced port's stale level
+    /// and the slider would jump under the user's finger. What must *not* be
+    /// written is a remembered level: the level the user just chose is the one
+    /// the sink is showing, and that is the one that goes back.
     fn refresh(&mut self) {
+        self.last_refresh = Some(Instant::now());
+
         let state = audio::sink_state().unwrap_or_default();
-        let port = state.port;
+        self.active_port = state.port.clone();
 
-        let moved = self.last_seen_port.is_some() && self.last_seen_port != port;
-        let forced_port = self.mode.forced_port();
-
-        // The volume belongs to the port that is active, and PipeWire keeps one
-        // volume per port. It is therefore only worth remembering while the
-        // active port is the one in force: once the driver moved elsewhere,
-        // the level on screen is that other port's stored level, not the
-        // user's. Losing that distinction is what made a forced switch land
-        // on the wrong number.
-        let on_forced_port = match forced_port {
-            Some(forced) => port.as_deref() == Some(forced),
-            None => true,
-        };
-
-        if moved {
-            // The driver moved the port, so the volume now on screen belongs
-            // to the new port. The level the user chose is written back onto
-            // it, which is only needed when the driver owns the port: in a
-            // forced mode the re-apply below carries the volume across.
-            if forced_port.is_none() {
-                if let Some(volume) = self.last_volume {
-                    let _ = audio::set_sink_volume(volume);
-                }
-            }
-        } else if on_forced_port {
-            if let Some(volume) = state.volume {
-                self.last_volume = Some(volume);
-            }
-        }
-
-        self.last_seen_port = port.clone();
-        self.active_port = port;
-
-        if forced_port.is_none() {
-            self.wrong_count = 0;
-            self.wrong_port = None;
-            self.mismatch_since = None;
+        if self.mode.forced_port().is_none() {
             return;
         }
 
@@ -225,57 +258,66 @@ impl AppModel {
             self.last_auto_mute_guard = Some(Instant::now());
         }
 
-        let Some(forced) = self.mode.forced_port() else {
-            return;
-        };
+        let since_apply = self.last_forced_apply.map(|at| at.elapsed());
+        let decision = correction(
+            self.mode,
+            self.active_port.as_deref(),
+            since_apply,
+            state.volume,
+        );
 
-        let active = self.active_port.as_deref();
+        match decision {
+            Correction::Keep | Correction::Wait => {}
+            Correction::Move { level } => {
+                let Some(sink) = state.name.as_deref() else {
+                    return;
+                };
 
-        // Already at our forced port, or the driver chose the same port as
-        // the one we forced last time.
-        if active == Some(forced) || self.last_forced_port.as_deref() == active {
-            self.wrong_count = 0;
-            self.wrong_port = None;
-            self.mismatch_since = None;
-            self.last_forced_port = Some(forced.to_string());
-            return;
-        }
+                // The port comes first: the level is written onto the port the
+                // sink is on after that write.
+                let _ = audio::apply_port(sink, self.mode);
 
-        // The port is not the one in force. Wait for the hardware to settle
-        // after the last apply before treating it as a real mismatch.
-        if let Some(last) = self.last_forced_apply {
-            if last.elapsed() < Duration::from_secs(3) {
-                return;
+                // The level is restored onto the port the sink is on now, so
+                // the correction leaves the sink showing what it was showing.
+                // Without a level there is nothing to restore: a level is
+                // never guessed.
+                if let Some(level) = level {
+                    let _ = audio::set_volume(sink, level);
+                }
+
+                // This write is the applet's own, so the settle window starts
+                // over: the sink list can still report the old port right
+                // after it.
+                self.last_forced_apply = Some(Instant::now());
             }
         }
+    }
 
-        // Track consecutive polls that saw the same wrong port.
-        if self.wrong_port.as_deref() == active {
-            self.wrong_count = self.wrong_count.saturating_add(1);
-        } else {
-            self.wrong_port = active.map(|s| s.to_string());
-            self.wrong_count = 1;
-            self.mismatch_since = Some(Instant::now());
+    /// Reacts to a sink event from the sound server.
+    ///
+    /// The event only says *that* a sink changed; the port has to be read
+    /// again. Events arrive in bursts — one port change produces several of
+    /// them — and every refresh costs two `pactl` calls, so a refresh that is
+    /// too recent is deferred instead of dropped. Dropping it would lose the
+    /// very event that carries the flip.
+    fn on_sink_event(&mut self) -> Task<Message> {
+        if refresh_due(self.last_refresh.map(|at| at.elapsed())) {
+            self.refresh();
+            return Task::none();
         }
 
-        let settled = self
-            .mismatch_since
-            .map(|since| since.elapsed() >= MISMATCH_SETTLE)
-            .unwrap_or(false);
-
-        if self.wrong_count >= MISMATCH_POLLS && settled {
-            // The level the user had on the forced port is carried across the
-            // switch: by now the sink shows the level stored on the port the
-            // driver moved to, and restoring that would land on the wrong
-            // number.
-            let _ = audio::apply_preserving(self.mode, self.last_volume);
-            self.last_forced_apply = Some(Instant::now());
-            self.last_forced_port = Some(forced.to_string());
-            self.active_port = audio::sink_state().ok().and_then(|state| state.port);
-            self.wrong_count = 0;
-            self.wrong_port = None;
-            self.mismatch_since = None;
+        if self.refresh_scheduled {
+            // A deferred refresh is already pending: it will read the state
+            // once the burst is over.
+            return Task::none();
         }
+
+        self.refresh_scheduled = true;
+
+        cosmic::task::future(async {
+            tokio::time::sleep(EVENT_DEBOUNCE).await;
+            Message::DeferredRefresh
+        })
     }
 
     /// Selects a mode, applies it and refreshes the reported port.
@@ -294,9 +336,6 @@ impl AppModel {
     /// the driver's own control and leaves the port alone.
     fn set_mode(&mut self, mode: OutputMode) {
         self.mode = mode;
-        self.wrong_count = 0;
-        self.wrong_port = None;
-        self.mismatch_since = None;
 
         // A mode the user picked wins over a startup restore that is still
         // retrying: the restore would otherwise re-apply the old mode over
@@ -308,9 +347,10 @@ impl AppModel {
         if result.is_ok() {
             state::save(mode);
 
-            if let Some(forced) = mode.forced_port() {
+            if mode.forced_port().is_some() {
+                // The applet's own write starts the settle window: the sink
+                // list can still report the old port right after it.
                 self.last_forced_apply = Some(Instant::now());
-                self.last_forced_port = Some(forced.to_string());
             }
         }
 
@@ -411,6 +451,10 @@ pub enum Message {
     RestoreAttempt,
     /// Periodic check to re-assert a forced output mode if the driver flipped it.
     CheckPort,
+    /// The sound server reported that a sink changed.
+    SinkEvent,
+    /// A refresh the event debounce deferred.
+    DeferredRefresh,
 }
 
 impl cosmic::Application for AppModel {
@@ -486,6 +530,15 @@ impl cosmic::Application for AppModel {
             Message::CheckPort => {
                 self.refresh();
             }
+            Message::SinkEvent => {
+                return self.on_sink_event();
+            }
+            Message::DeferredRefresh => {
+                // The deferred refresh reads the state once the burst of
+                // events is over.
+                self.refresh_scheduled = false;
+                self.refresh();
+            }
             Message::Surface(action) => {
                 return cosmic::task::message(cosmic::Action::Surface(action));
             }
@@ -506,9 +559,8 @@ impl cosmic::Application for AppModel {
 
                         // The mode is now in force, so the periodic check must
                         // not treat the port as a mismatch right away.
-                        if let Some(forced) = restore.mode.forced_port() {
+                        if restore.mode.forced_port().is_some() {
                             self.last_forced_apply = Some(Instant::now());
-                            self.last_forced_port = Some(forced.to_string());
                         }
 
                         self.refresh();
@@ -542,7 +594,10 @@ impl cosmic::Application for AppModel {
         // panel icon and the popup check mark follow the change.
         let control = control::subscription().map(|_| Message::Cycle);
         let poll = cosmic::iced::time::every(Duration::from_secs(2)).map(|_| Message::CheckPort);
-        Subscription::batch(vec![control, poll])
+        // The sound server's own event stream: a port the driver moved is
+        // corrected in tens of milliseconds instead of on the next poll.
+        let events = watch::subscription().map(|_| Message::SinkEvent);
+        Subscription::batch(vec![control, poll, events])
     }
 
     fn view(&self) -> Element<'_, Message> {
@@ -611,6 +666,132 @@ impl cosmic::Application for AppModel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const LINE_OUT: &str = "analog-output-lineout";
+    const HEADPHONES: &str = "analog-output-headphones";
+
+    /// A level the sink could be showing.
+    const LEVEL: Option<u32> = Some(62);
+
+    /// Time since the applet's own write, once the hardware has settled.
+    fn settled_ago() -> Duration {
+        APPLY_SETTLE + Duration::from_millis(1)
+    }
+
+    #[test]
+    fn a_forced_port_that_is_already_active_is_left_alone() {
+        // The port is already the forced one: there is nothing to write, not
+        // even the level.
+        assert_eq!(
+            correction(OutputMode::Speakers, Some(LINE_OUT), None, LEVEL),
+            Correction::Keep
+        );
+        assert_eq!(
+            correction(OutputMode::Headphones, Some(HEADPHONES), None, LEVEL),
+            Correction::Keep
+        );
+    }
+
+    #[test]
+    fn auto_never_corrects_the_port() {
+        // `Auto` hands arbitration back to the driver: whatever port the
+        // driver picks is the one the user gets, however unexpected it looks.
+        // The level is not touched either.
+        assert_eq!(
+            correction(OutputMode::Auto, Some(LINE_OUT), None, LEVEL),
+            Correction::Keep
+        );
+        assert_eq!(
+            correction(OutputMode::Auto, Some(HEADPHONES), None, LEVEL),
+            Correction::Keep
+        );
+    }
+
+    #[test]
+    fn a_moved_port_is_corrected_once_the_hardware_settled() {
+        // The driver moved the port while a mode was in force: it has to be
+        // put back, and the correction must not wait for a second poll.
+        assert_eq!(
+            correction(
+                OutputMode::Speakers,
+                Some(HEADPHONES),
+                Some(settled_ago()),
+                LEVEL
+            ),
+            Correction::Move { level: LEVEL }
+        );
+    }
+
+    #[test]
+    fn a_port_moved_right_after_our_own_write_is_not_corrected_yet() {
+        // The write is asynchronous: the sink list can still report the old
+        // port right after it. Correcting on that transient is what used to
+        // fight the user's own volume control.
+        assert_eq!(
+            correction(
+                OutputMode::Speakers,
+                Some(HEADPHONES),
+                Some(Duration::from_millis(10)),
+                LEVEL
+            ),
+            Correction::Wait
+        );
+    }
+
+    #[test]
+    fn a_mode_that_was_never_applied_is_corrected_right_away() {
+        assert_eq!(
+            correction(OutputMode::Speakers, Some(HEADPHONES), None, LEVEL),
+            Correction::Move { level: LEVEL }
+        );
+    }
+
+    #[test]
+    fn a_correction_puts_the_observed_level_back() {
+        // PipeWire keeps one level per port, so a port write alone would leave
+        // the sink showing the forced port's stale level and the slider would
+        // jump. The level the sink is showing right now has to go with it.
+        assert_eq!(
+            correction(
+                OutputMode::Speakers,
+                Some(HEADPHONES),
+                Some(settled_ago()),
+                Some(85)
+            ),
+            Correction::Move { level: Some(85) }
+        );
+    }
+
+    #[test]
+    fn a_correction_without_an_observed_level_writes_no_volume() {
+        // A level is never guessed: without one the correction moves the port
+        // and leaves the level alone.
+        assert_eq!(
+            correction(
+                OutputMode::Speakers,
+                Some(HEADPHONES),
+                Some(settled_ago()),
+                None
+            ),
+            Correction::Move { level: None }
+        );
+    }
+
+    #[test]
+    fn the_settle_window_is_the_only_thing_that_holds_a_correction_back() {
+        assert!(settled(None), "nothing was applied, nothing to wait for");
+        assert!(settled(Some(APPLY_SETTLE)));
+        assert!(!settled(Some(APPLY_SETTLE - Duration::from_millis(1))));
+    }
+
+    #[test]
+    fn a_refresh_that_is_too_recent_is_deferred_instead_of_dropped() {
+        // Dropping the event would lose the flip: the volume-change event and
+        // the flip arrive a couple of milliseconds apart.
+        assert!(refresh_due(None), "the first refresh is always due");
+        assert!(!refresh_due(Some(Duration::from_millis(1))));
+        assert!(refresh_due(Some(EVENT_DEBOUNCE)));
+    }
 
     #[test]
     fn escape_closes_the_open_popup() {

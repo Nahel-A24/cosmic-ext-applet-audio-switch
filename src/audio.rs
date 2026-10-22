@@ -232,18 +232,15 @@ impl std::fmt::Display for AudioError {
 impl std::error::Error for AudioError {}
 
 /// Applies an output mode to the live sound stack.
-pub fn apply(mode: OutputMode) -> Result<(), AudioError> {
-    apply_preserving(mode, None)
-}
-
-/// Applies an output mode, carrying a known volume level across the switch.
 ///
-/// `volume` is the level the user chose. `None` means "use whatever the sink
-/// is playing right now", which is what a switch the user just asked for
-/// wants. The correction path passes the level it saw *before* the driver
-/// moved the port: by then the sink already shows the other port's stored
-/// level, so capturing it here would restore the wrong number.
-pub fn apply_preserving(mode: OutputMode, volume: Option<u32>) -> Result<(), AudioError> {
+/// This is the path a *user-initiated* switch takes: the level the user is
+/// listening to is carried across to the new port, because PipeWire keeps one
+/// volume per port and the other port's stored level is not what the user
+/// asked for.
+///
+/// The correction path — the one that puts a port back after the driver moved
+/// it — is [`apply_port`], which writes the port and nothing else.
+pub fn apply(mode: OutputMode) -> Result<(), AudioError> {
     // A single discovery feeds both halves of a mode change: the sink name
     // drives the port and the sink's own ALSA card drives the mixer. It also
     // runs before anything is written, so a machine with no analog sink fails
@@ -262,11 +259,10 @@ pub fn apply_preserving(mode: OutputMode, volume: Option<u32>) -> Result<(), Aud
             // volume is captured before the switch and written back onto the
             // new port afterwards, so forcing an output never changes how loud
             // the user hears it.
-            let volume = volume.or(sink.volume);
             set_sink_port_on(&sink.name, port)?;
 
-            if let Some(percent) = volume {
-                let _ = set_sink_volume_on(&sink.name, percent);
+            if let Some(percent) = sink.volume {
+                let _ = set_volume(&sink.name, percent);
             }
 
             Ok(())
@@ -283,6 +279,26 @@ pub fn apply_preserving(mode: OutputMode, volume: Option<u32>) -> Result<(), Aud
             other => other,
         },
     }
+}
+
+/// Writes only the port of an already-discovered sink.
+///
+/// This is the correction path, and it is deliberately narrower than
+/// [`apply`]: it writes the port and nothing else. The level is restored
+/// separately, by the caller, with the level the sink was showing *before*
+/// the port write — PipeWire keeps one level per port, so the port write
+/// alone would leave the sink showing the forced port's stale level. Writing
+/// a *remembered* level instead is what used to freeze the volume.
+///
+/// `Auto` has no port to force, so it is a no-op: handing arbitration back to
+/// the driver is [`apply`]'s job, and forcing a port here would fight the
+/// driver on the next jack event.
+pub fn apply_port(sink: &str, mode: OutputMode) -> Result<(), AudioError> {
+    let Some(port) = mode.forced_port() else {
+        return Ok(());
+    };
+
+    set_sink_port_on(sink, port)
 }
 
 /// Runs `pactl` with a forced C locale.
@@ -350,8 +366,9 @@ struct Sink {
     ///
     /// PipeWire keeps one volume per port, so this value belongs to the port
     /// that is active right now. Moving the port swaps it for the value stored
-    /// on the target port, which is why the applet has to carry the volume
-    /// across a port switch.
+    /// on the target port, which is why a user-initiated switch has to carry
+    /// the volume across — and why a correction has to put the level it read
+    /// back onto the port it just moved to.
     volume: Option<u32>,
 }
 
@@ -567,9 +584,9 @@ fn set_sink_port_on(sink: &str, port: &str) -> Result<(), AudioError> {
 /// Writes a volume percentage onto an already-discovered sink.
 ///
 /// The percentage is applied to the sink's *active* port, which is what makes
-/// it the right call after a port switch: the value lands on the port the user
+/// it the right call after a port write: the value lands on the port the user
 /// is now listening through instead of on the one they just left.
-fn set_sink_volume_on(sink: &str, percent: u32) -> Result<(), AudioError> {
+pub fn set_volume(sink: &str, percent: u32) -> Result<(), AudioError> {
     let value = format!("{percent}%");
     let args = ["set-sink-volume", sink, value.as_str()];
     let output = pactl(&args)?;
@@ -585,35 +602,48 @@ fn set_sink_volume_on(sink: &str, percent: u32) -> Result<(), AudioError> {
     }
 }
 
-/// Live state of the analog sink: the active port and the current volume.
+/// Live state of the analog sink: its name, the port it plays through and the
+/// level it is showing.
 ///
-/// Both come from a single `pactl list sinks` call so the periodic check does
-/// not pay for two processes every tick.
+/// All of it comes from a single `pactl list sinks` call so the periodic check
+/// does not pay for two processes every tick.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SinkState {
+    /// PipeWire node name of the analog sink, e.g.
+    /// `alsa_output.pci-0000_00_1f.3.analog-stereo`.
+    ///
+    /// The correction path needs it to address the sink without paying for a
+    /// second discovery round-trip.
+    pub name: Option<String>,
     /// Port the sink is playing through right now.
     pub port: Option<String>,
-    /// Volume of that port, as a percentage of the base volume.
+    /// Level the sink is showing right now, as a percentage of the base
+    /// volume.
+    ///
+    /// PipeWire keeps one level per port, so this is the level of the port
+    /// that is active — the one the user is looking at.
     pub volume: Option<u32>,
 }
 
-/// Reads the analog sink's active port and volume.
+/// Reads the analog sink's name, active port and level.
 pub fn sink_state() -> Result<SinkState, AudioError> {
     let output = pactl_stdout(&["list", "sinks"])?;
     let default = default_sink().ok().flatten();
 
-    Ok(find_analog_sink(&output, default.as_deref())
-        .map(|sink| SinkState {
-            port: sink.active_port,
-            volume: sink.volume,
-        })
-        .unwrap_or_default())
+    Ok(state_of(find_analog_sink(&output, default.as_deref())))
 }
 
-/// Writes a volume percentage onto the analog sink's active port.
-pub fn set_sink_volume(percent: u32) -> Result<(), AudioError> {
-    let sink = discover_analog_sink()?;
-    set_sink_volume_on(&sink.name, percent)
+/// The live state of the sink that was found.
+///
+/// Split out of [`sink_state`] so the mapping can be exercised without a
+/// sound server.
+fn state_of(sink: Option<Sink>) -> SinkState {
+    sink.map(|sink| SinkState {
+        name: Some(sink.name),
+        port: sink.active_port,
+        volume: sink.volume,
+    })
+    .unwrap_or_default()
 }
 
 /// Chooses the enum item index whose label matches `wanted`.
@@ -867,6 +897,19 @@ Sink #2
 \tActive Port: analog-output-lineout
 ";
 
+    /// A sink that names itself only through its `node.name` property, which
+    /// is what a localized output does when the `Name:` header is translated.
+    const NODE_NAME_ONLY: &str = "\
+Sink #12
+\tState: SUSPENDED
+\tProperties:
+\t\tnode.name = \"alsa_output.pci-0000_00_1f.3.analog-stereo\"
+\tPorts:
+\t\tanalog-output-lineout: Line Out (type: Line, priority: 9000, available)
+\t\tanalog-output-headphones: Headphones (type: Headphones, priority: 9900, available)
+\tActive Port: analog-output-lineout
+";
+
     #[test]
     fn parses_c_locale_sink() {
         let sinks = parse_sinks(C_LOCALE);
@@ -879,6 +922,61 @@ Sink #2
         assert_eq!(
             sinks[0].active_port.as_deref(),
             Some("analog-output-headphones")
+        );
+    }
+
+    #[test]
+    fn reads_the_sink_name_from_the_node_property() {
+        // The `node.name` key is never translated, so it is the primary
+        // anchor for the sink's name — the one the correction path needs to
+        // address the sink without a second discovery round-trip.
+        let sink = find_analog_sink(NODE_NAME_ONLY, None).expect("analog sink");
+        assert_eq!(sink.name, "alsa_output.pci-0000_00_1f.3.analog-stereo");
+        assert_eq!(sink.active_port.as_deref(), Some("analog-output-lineout"));
+    }
+
+    #[test]
+    fn reads_the_same_sink_name_from_both_anchors() {
+        // The C-locale header and the property carry the same value; the
+        // parser must not end up with a name that depends on which one it
+        // saw last.
+        let sinks = parse_sinks(C_LOCALE);
+        assert_eq!(sinks.len(), 1, "{sinks:?}");
+        assert_eq!(sinks[0].name, "alsa_output.pci-0000_00_1f.3.analog-stereo");
+    }
+
+    #[test]
+    fn the_sink_state_carries_the_name_the_port_and_the_level() {
+        // The correction path needs all three: the name to address the sink,
+        // the port to compare against the forced one, and the level to put
+        // back after the port write.
+        let state = state_of(find_analog_sink(C_LOCALE, None));
+
+        assert_eq!(
+            state.name.as_deref(),
+            Some("alsa_output.pci-0000_00_1f.3.analog-stereo")
+        );
+        assert_eq!(state.port.as_deref(), Some("analog-output-headphones"));
+        assert_eq!(state.volume, Some(70), "{state:?}");
+    }
+
+    #[test]
+    fn a_sink_without_a_volume_line_reports_no_level() {
+        // Without a level there is nothing to put back after a correction, and
+        // a level is never guessed.
+        let state = state_of(find_analog_sink(NODE_NAME_ONLY, None));
+
+        assert_eq!(state.volume, None, "{state:?}");
+    }
+
+    #[test]
+    fn applying_a_port_in_auto_writes_nothing() {
+        // `Auto` hands arbitration back to the driver, so there is no port to
+        // force. The empty sink name proves the call short-circuits: a forced
+        // mode would have tried to address it.
+        assert!(
+            apply_port("", OutputMode::Auto).is_ok(),
+            "`Auto` must not write a port"
         );
     }
 

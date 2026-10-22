@@ -13,6 +13,7 @@ mod audio;
 mod control;
 mod shortcut;
 mod state;
+mod watch;
 
 fn main() -> cosmic::iced::Result {
     // A custom shortcut spawns a fresh process; that process must not become an
