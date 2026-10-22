@@ -13,14 +13,12 @@ pub enum Lang {
 }
 
 fn detect() -> Lang {
-    for key in ["LC_ALL", "LC_MESSAGES", "LANG"] {
+    for key in ["LC_ALL", "LC_MESSAGES", "LANGUAGE", "LANG"] {
         if let Ok(v) = std::env::var(key) {
             let v = v.to_ascii_lowercase();
-            if v.starts_with("es") {
+            // LANGUAGE can be like "en:es"
+            if v.starts_with("es") || v.contains(":es") || v.contains(" es") {
                 return Lang::Es;
-            }
-            if !v.is_empty() && !v.starts_with("c") && !v.starts_with("posix") {
-                // non-C locale we don't know — stay English unless it's Spanish
             }
         }
     }
