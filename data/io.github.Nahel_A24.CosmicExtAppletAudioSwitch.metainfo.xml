@@ -37,14 +37,44 @@
     </p>
   </description>
 
+  <!--
+    Legacy tag consumed by appstream-glib, which is what flatpak uses to build
+    the repository AppStream data. The modern <developer> element below is kept
+    for AppStream 1.x validators and for a future generator that reads it.
+  -->
+  <developer_name>Nahel A24</developer_name>
+
   <launchable type="desktop-id">io.github.Nahel_A24.CosmicExtAppletAudioSwitch.desktop</launchable>
 
+  <screenshots>
+    <screenshot type="default">
+      <image>https://raw.githubusercontent.com/Nahel-A24/cosmic-ext-applet-audio-switch/main/screenshots/popup.png</image>
+      <caption>The popup lists the three modes and marks the active one</caption>
+      <caption xml:lang="es">El menú desplegable lista los tres modos y marca el activo</caption>
+    </screenshot>
+    <screenshot>
+      <image>https://raw.githubusercontent.com/Nahel-A24/cosmic-ext-applet-audio-switch/main/screenshots/panel.png</image>
+      <caption>The applet in the COSMIC panel while headphones are forced</caption>
+      <caption xml:lang="es">El applet en el panel de COSMIC con los auriculares forzados</caption>
+    </screenshot>
+  </screenshots>
+
+  <!--
+    `com.system76.CosmicApplet` is what puts the app in the store's Applets
+    tab (Subprogramas); the store matches this provide, not a category.
+  -->
   <provides>
+    <id>com.system76.CosmicApplet</id>
     <binary>cosmic-ext-applet-audio-switch</binary>
   </provides>
 
+  <!--
+    `AudioVideo` describes what it does; `Utility` is what the store's
+    Utilities tab filters on.
+  -->
   <categories>
     <category>AudioVideo</category>
+    <category>Utility</category>
   </categories>
 
   <developer id="io.github.nahel_a24">
@@ -54,7 +84,14 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
+    <release version="0.1.1" date="2026-10-25">
+      <description>
+        <p>Hold the forced output port while the volume changes and keep the level the user set.</p>
+        <p xml:lang="es">Mantiene el puerto de salida forzado al cambiar el volumen y respeta el nivel elegido.</p>
+      </description>
+    </release>
     <release version="0.1.0" date="2026-10-15"/>
   </releases>
   <url type="homepage">https://github.com/Nahel-A24/cosmic-ext-applet-audio-switch</url>
+  <url type="bugtracker">https://github.com/Nahel-A24/cosmic-ext-applet-audio-switch/issues</url>
 </component>
